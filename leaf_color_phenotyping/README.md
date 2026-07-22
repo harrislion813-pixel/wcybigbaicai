@@ -119,7 +119,148 @@ output/
 
 ---
 
-## 二、认识输入图片的命名规则
+## 二、功能实现模块：图片是怎样变成表型数据的
+
+可以把整个程序想象成一条“叶片图片加工流水线”：
+
+~~~text
+原始图片 + config.yaml
+        ↓
+1. 读取图片并统一颜色
+        ↓
+2. 从背景中抠出叶片
+        ↓
+3. 只在叶片区域计算特征
+        ↓
+4. 生成质量检查指标
+        ↓
+5. 合并同一样本的重复图片
+        ↓
+CSV / Excel / JSON + 分割检查图
+~~~
+
+批处理入口 scripts/batch_extract.py 像“总开关”：它读取命令和配置文件，然后让 src/pipeline.py 按顺序调用下面的功能模块。
+
+### 模块 1：读取和校正图片
+
+对应文件：src/preprocessing.py、src/utils.py
+
+这个模块负责把不同来源的图片整理成程序能够统一处理的 RGB 数据。
+
+它主要做四件事：
+
+1. 读取 JPG、PNG、TIFF 或 RAW 图片。
+2. 把像素统一换算到 0 到 1。
+3. 根据设置执行灰度世界、灰卡等白平衡。
+4. 如果启用了 CCM，再进行颜色校准。
+
+可以把它理解为：先把不同相机拍出的照片“调整到同一把尺子上”，再比较叶片颜色。
+
+如果只想快速使用，采用 gray_world，并关闭颜色校准即可。
+
+### 模块 2：从背景中找到叶片
+
+对应文件：src/segmentation.py
+
+分割就是给叶片“抠图”。程序会生成一张只有黑色和白色的掩膜：
+
+~~~text
+白色区域 = 叶片，参与特征计算
+黑色区域 = 背景，不参与特征计算
+~~~
+
+ExG 根据“叶片通常比背景更绿”来识别叶片；GrabCut 会结合颜色和画面位置进一步寻找前景；U-Net 和 SAM 则使用模型预测叶片范围。
+
+这是整条流程中最需要检查的一步。如果把背景误认为叶片，后面的颜色、植被指数和纹理都会一起受到影响。因此第一次处理新批次图片时，务必添加 --visualize。
+
+### 模块 3：计算叶片特征
+
+只有掩膜中的白色叶片区域会进入特征计算。
+
+| 特征类型 | 对应文件 | 通俗解释 |
+|---|---|---|
+| 颜色特征 | src/color_features.py | 叶片有多亮、多绿、多黄，以及颜色分布是否均匀 |
+| 植被指数 | src/vegetation_indices.py | 用 R、G、B 通道组合出 ExG、VARI、DGCI 等指标 |
+| 纹理特征 | src/texture_features.py | 叶面看起来是否平滑、粗糙、均匀或具有方向性 |
+| 形状特征 | src/texture_features.py | 叶片面积、周长、圆度、长宽和紧实程度 |
+
+例如，CIELAB_L_mean 表示叶片区域的平均明亮程度；ExG 表示叶片区域的平均超绿指数，ExG_std 表示单张图片内叶片像素超绿指数的标准差。
+
+### 模块 4：给结果附上质量检查指标
+
+对应文件：src/pipeline.py
+
+程序不会只给出表型值，还会同时记录：
+
+- 识别出的叶片有多少像素。
+- 叶片占整张图片的比例。
+- 是否完全没有识别出叶片。
+- 叶片外接框的位置和大小。
+
+这些列以 QC_ 开头。它们像体检报告中的“异常提示”，帮助你找到需要重新分割或剔除的图片。
+
+程序不会擅自删除异常样本，因为不同拍摄距离下，合理的叶片面积比例可能不同。应先查看分割图，再根据自己的实验条件设置筛选标准。
+
+### 模块 5：识别样本并合并重复图片
+
+对应文件：src/utils.py、src/pipeline.py
+
+程序先从文件名得到 sample_id，再把同一样本的重复图片放在一起。例如：
+
+~~~text
+BJC-001_rep1.jpg ┐
+BJC-001_rep2.jpg ├─→ sample_id = BJC-001
+BJC-001_rep3.jpg ┘
+~~~
+
+假设三张图片都计算出了 CIELAB_L_mean，聚合后会得到：
+
+~~~text
+CIELAB_L_mean         三张重复图片的平均值
+CIELAB_L_mean_rep_std 三张重复图片之间的标准差
+CIELAB_L_mean_rep_cv  三张重复图片之间的变异系数
+n_replicates          实际参与计算的重复图片数
+~~~
+
+因此，rep_std 或 rep_cv 很大时，通常意味着重复图片差异较大，应返回原图和分割图检查。
+
+### 模块 6：保存表格和检查图
+
+对应文件：src/pipeline.py
+
+最后，程序根据输出文件扩展名保存 CSV、XLSX 或 JSON，并在启用 --visualize 时生成分割检查图。
+
+如果有图片处理失败，还会单独保存以 _failures.csv 结尾的报告。这样成功结果不会丢失，失败原因也能被追踪。
+
+### 用一个样本串起整个过程
+
+以 BJC-001_rep1.jpg 为例：
+
+1. 程序读取图片，执行 gray_world 白平衡。
+2. ExG 生成叶片掩膜，背景被排除。
+3. 在叶片像素中计算 CIELAB、ExG、纹理和形状。
+4. 记录叶片面积比例等 QC 指标。
+5. 与 BJC-001 的其他重复图片合并。
+6. 在结果表中生成 sample_id 为 BJC-001 的一行数据。
+
+如果使用 --no-aggregate，第 5 步会被跳过，每张图片各保留一行。
+
+### 想增加新功能时改哪里
+
+| 想增加的功能 | 优先修改的位置 |
+|---|---|
+| 新植被指数 | src/vegetation_indices.py |
+| 新颜色统计量 | src/color_features.py |
+| 新纹理或形状指标 | src/texture_features.py |
+| 新分割方法 | src/segmentation.py，并在 create_segmenter 中注册 |
+| 新输出列或聚合规则 | src/pipeline.py |
+| 新命令行参数 | scripts/batch_extract.py |
+
+修改后，应在 tests 中补充对应测试，并运行 python -m pytest，确认原有功能没有被破坏。
+
+---
+
+## 三、认识输入图片的命名规则
 
 默认情况下，多张重复图片会自动合并成一个样本。
 
@@ -171,7 +312,7 @@ python scripts/batch_extract.py --input data/raw_images --output output/per_imag
 
 ---
 
-## 三、推荐的配置文件运行方式
+## 四、推荐的配置文件运行方式
 
 命令行适合快速试用；正式项目建议保存一份 config.yaml，以便日后复现实验。
 
@@ -216,7 +357,7 @@ python scripts/batch_extract.py --config config.yaml --method grabcut --output o
 
 ---
 
-## 四、该选哪一种分割方法
+## 五、该选哪一种分割方法
 
 | 方法 | 是否需要模型 | 是否需要显卡 | 适合场景 |
 |---|---:|---:|---|
@@ -284,7 +425,7 @@ segmentation:
 
 ---
 
-## 五、如何训练 U-Net
+## 六、如何训练 U-Net
 
 只有在传统分割效果不够稳定时，才需要这一步。
 
@@ -338,7 +479,7 @@ python scripts/batch_extract.py --input data/raw_images --output output/unet_res
 
 ---
 
-## 六、白平衡怎么选
+## 七、白平衡怎么选
 
 ### gray_world：默认推荐
 
@@ -380,7 +521,7 @@ imaging:
 
 ---
 
-## 七、颜色校准是否需要开启
+## 八、颜色校准是否需要开启
 
 ### 不需要开启的情况
 
@@ -449,7 +590,7 @@ color_calibration:
 
 ---
 
-## 八、输出文件怎么看
+## 九、输出文件怎么看
 
 ### 1. 每张图片的基础特征
 
@@ -508,7 +649,7 @@ python scripts/batch_extract.py --input data/raw_images --output output/result.c
 
 ---
 
-## 九、如何判断一批数据是否处理成功
+## 十、如何判断一批数据是否处理成功
 
 建议按下面顺序检查：
 
@@ -542,7 +683,7 @@ python scripts/batch_extract.py --input data/raw_images --output output/result.c
 
 ---
 
-## 十、常见问题
+## 十一、常见问题
 
 ### 问题 1：提示 No images found
 
@@ -632,7 +773,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 ---
 
-## 十一、正式用于 GWAS 前的建议
+## 十二、正式用于 GWAS 前的建议
 
 建议保留两个版本的数据：
 
@@ -665,7 +806,7 @@ dat <- merge(dat, geno, by = "sample_id")
 
 ---
 
-## 十二、运行自动测试
+## 十三、运行自动测试
 
 如果你修改了代码，建议先安装测试依赖：
 
@@ -683,7 +824,7 @@ python -m pytest
 
 ---
 
-## 十三、项目目录说明
+## 十四、项目目录说明
 
 ~~~text
 leaf_color_phenotyping/
@@ -711,7 +852,7 @@ leaf_color_phenotyping/
 
 ---
 
-## 十四、最常用命令速查
+## 十五、最常用命令速查
 
 最简单的 CPU 处理：
 
