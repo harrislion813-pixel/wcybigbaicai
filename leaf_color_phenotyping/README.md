@@ -1,201 +1,756 @@
-# 🍃 大白菜叶色表型提取工具包
+# 大白菜叶色表型提取：从零开始操作指南
 
-基于图像的 **大白菜叶色性状高通量提取** 工具包，专为 **GWAS 关联分析** 设计。
+这是一套从叶片图片中批量提取颜色、植被指数和纹理特征的 Python 工具。
 
-## 核心能力
+如果你第一次使用本项目，按本文的顺序操作即可。最稳妥的入门方案是：
 
-| 模块 | 功能 | 提取特征数 |
-|------|------|-----------|
-| **预处理** | RAW读取、白平衡、ColorChecker颜色校准 | — |
-| **叶片分割** | ExG阈值 / GrabCut / U-Net / SAM | — |
-| **颜色特征** | RGB、HSV、CIELAB、YCbCr + 颜色矩 + 直方图 | ~150 |
-| **植被指数** | VARI, GLI, ExG, DGCI, CIVE, MGRVI 等 13 个指数 | ~39 |
-| **色度坐标** | CIE xyY, CIE u'v' | ~8 |
-| **纹理特征** | GLCM (对比度/同质性/能量/相关性/ASM) | ~60 |
-| **形状特征** | 面积/周长/圆度/偏心率/坚实度/长宽比 | ~10 |
-| **均匀性** | CIELAB空间色差分布 (斑驳/黄化不均匀性) | ~8 |
-| **合计** | | **~275 个性状** |
+1. 把图片放进 data/raw_images。
+2. 使用传统 ExG 分割，不需要模型，也不需要显卡。
+3. 输出 CSV 文件并检查分割图。
+4. 确认结果可靠后，再考虑 U-Net、SAM 或颜色校准。
 
-## 快速开始
+> 重要：本工具可以自动计算表型，但不能替代实验设计和人工质控。正式分析前，请抽查分割结果，并结合 QC 列过滤失败样本。
 
-### 安装
+---
 
-```bash
-cd leaf_color_phenotyping
+## 一、最快跑通：只做这 5 步
 
-# 基础安装 (仅传统分割)
-pip install numpy opencv-python scikit-image pandas PyYAML
+以下命令都要在 leaf_color_phenotyping 项目目录中执行。
 
-# 完整安装 (含深度学习)
-pip install -r requirements.txt
+### 第 1 步：打开终端并进入项目目录
 
-# 开发与测试
-pip install -r requirements-dev.txt
-pytest
-```
+Windows PowerShell 示例：
 
-### 单张图像快速验证
+~~~powershell
+cd C:\你的项目路径\wcybigbaicai\leaf_color_phenotyping
+~~~
 
-```python
-from src.pipeline import LeafColorPipeline
+macOS 或 Linux 示例：
 
-pipeline = LeafColorPipeline()
-result = pipeline.process_single(
-    "data/raw_images/BJC-001_rep1.jpg",
-    sample_id="BJC-001",
-    replicate="rep1",
-    developmental_stage="heading",
-    return_visualization=True,
-)
+~~~bash
+cd /你的项目路径/wcybigbaicai/leaf_color_phenotyping
+~~~
 
-# 查看提取的特征
-for k, v in result["features"].items():
-    print(f"  {k}: {v:.4f}")
+### 第 2 步：创建并启用虚拟环境
 
-# 保存可视化
-import cv2
-from src.utils import write_image_rgb
-write_image_rgb("output/BJC-001_vis.jpg", result["visualization"])
-```
+Windows PowerShell：
 
-### 批量处理 (GWAS表型数据生成)
+~~~powershell
+python -m venv .venv
+Set-ExecutionPolicy -Scope Process Bypass
+.\.venv\Scripts\Activate.ps1
+~~~
 
-```bash
-# 命令行
-python scripts/batch_extract.py \
-    --input data/raw_images/ \
-    --output results/phenotypes.csv \
-    --method exg \
-    --verbose
+macOS 或 Linux：
 
-# 或 Python
-python -c "
-from src.pipeline import LeafColorPipeline
-pipeline = LeafColorPipeline()
-df = pipeline.process_batch('data/raw_images/', output_csv='phenotypes.csv')
-print(df.describe())
-"
-```
+~~~bash
+python3 -m venv .venv
+source .venv/bin/activate
+~~~
 
-## 输出表型表格式
+启用成功后，命令行前面通常会出现 (.venv)。
 
-输出 CSV 示例（用于 GWAS 分析的输入）：
+如果 Windows 上没有 python 命令，可以把本文命令中的 python 换成 py。
 
-| sample_id | n_replicates | CIELAB_L_mean | CIELAB_A_mean | CIELAB_B_mean | GLI | DGCI | ... |
-|-----------|-------------|---------------|---------------|---------------|-----|------|-----|
-| BJC-001 | 3 | 45.23 | -18.56 | 32.10 | 0.234 | 0.567 | ... |
-| BJC-002 | 3 | 38.91 | -15.23 | 28.44 | 0.198 | 0.612 | ... |
-| ... | ... | ... | ... | ... | ... | ... | ... |
+### 第 3 步：安装最基本的依赖
 
-每个性状的 `_mean`、`_std`、`_cv` 列分别代表：
-- 原始特征名中的 `_mean` / `_std` 表示**单张叶片 ROI 内像素**的统计量，
-  例如 `CIELAB_L_mean` 和 `CIELAB_L_std`。
-- 多重复汇总后的均值保留原始特征名，例如 `CIELAB_L_mean`。
-- 重复间标准差和变异系数追加 `_rep_std` / `_rep_cv`，例如
-  `CIELAB_L_mean_rep_std` 和 `CIELAB_L_mean_rep_cv`。
-- 当重复均值接近零时，CV 输出为缺失值，避免产生无意义的极大数。
+只使用 ExG、GrabCut 和自动传统分割时，安装下面这些包即可：
 
-## 项目结构
+~~~bash
+python -m pip install --upgrade pip
+python -m pip install numpy opencv-python scikit-image pandas PyYAML openpyxl
+~~~
 
-```
+如果要读取相机 RAW 文件，再安装：
+
+~~~bash
+python -m pip install rawpy
+~~~
+
+如果要训练或运行 U-Net，请安装完整依赖：
+
+~~~bash
+python -m pip install -r requirements.txt
+~~~
+
+完整依赖包含 PyTorch、分割模型和绘图工具，下载体积较大。第一次试用本项目时，不必先安装完整依赖。
+
+### 第 4 步：放入图片
+
+在项目目录下建立或使用下面的文件夹：
+
+~~~text
 leaf_color_phenotyping/
-├── config.yaml                  # 全局配置文件
-├── requirements.txt
-├── README.md
-├── src/
-│   ├── __init__.py
-│   ├── utils.py                 # 工具函数、色彩空间转换、色差公式
-│   ├── preprocessing.py         # RAW读取、白平衡、颜色校准(CCM)
-│   ├── segmentation.py          # 叶片分割 (ExG/GrabCut/U-Net/SAM)
-│   ├── color_features.py        # 多颜色空间特征提取
-│   ├── vegetation_indices.py    # RGB植被指数 + SPAD估算
-│   ├── texture_features.py      # GLCM纹理 + 形状特征 + 均匀性
-│   └── pipeline.py              # 完整流水线编排器
-├── scripts/
-│   ├── batch_extract.py         # 批量提取命令行工具
-│   └── train_segmentation.py    # U-Net分割模型训练脚本
-├── notebooks/                   # Jupyter Notebook (交互式分析)
-├── models/                      # 预训练模型存放目录
-├── data/                        # 示例数据
-└── output/                      # 结果输出目录
-```
+└── data/
+    └── raw_images/
+        ├── BJC-001_rep1.jpg
+        ├── BJC-001_rep2.jpg
+        ├── BJC-002_rep1.jpg
+        └── BJC-002_rep2.jpg
+~~~
 
-## 分割方法选择指南
+支持的常见图片包括 JPG、JPEG、PNG、TIF、TIFF 和 BMP。安装 rawpy 后，还可读取常见 RAW 格式。
 
-| 方法 | 速度 | 精度 | GPU需求 | 适用场景 |
-|------|------|------|---------|---------|
-| `exg` | ⚡⚡⚡ | ⭐⭐ | 不需要 | 绿色叶片 + 均匀背景 |
-| `grabcut` | ⚡⚡ | ⭐⭐⭐ | 不需要 | 复杂背景, 无GPU |
-| `unet` | ⚡⚡ | ⭐⭐⭐⭐⭐ | 需要 | 大规模批处理 (需先训练) |
-| `sam` | ⚡ | ⭐⭐⭐⭐⭐ | 需要 | 零样本, 无需标注 |
+建议：
 
-## 颜色校准流程 (推荐)
+- 一张图片尽量只放一片主要叶片。
+- 叶片不要紧贴图片边缘。
+- 背景与绿色叶片的颜色差异越大，自动分割越稳定。
+- 同一批图片尽量使用相同光源、相机、曝光和拍摄距离。
+- 不要先用社交软件压缩图片。
 
-为确保不同批次图像颜色可比，正式实验应进行颜色校准。流水线不会再把
-“启用但没有 CCM”的配置当作成功：应先计算并保存校正矩阵，再在配置中启用。
+### 第 5 步：复制命令并运行
 
-```python
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/leaf_color_phenotypes.csv --method exg --white-balance gray_world --visualize --verbose
+~~~
+
+运行结束后，重点查看：
+
+~~~text
+output/
+├── leaf_color_phenotypes.csv
+└── visualizations/
+    ├── BJC-001_rep1_vis.jpg
+    └── ...
+~~~
+
+如果 CSV 已生成，而且 visualizations 中的绿色轮廓基本覆盖叶片、没有大面积覆盖背景，说明最基本流程已经跑通。
+
+---
+
+## 二、认识输入图片的命名规则
+
+默认情况下，多张重复图片会自动合并成一个样本。
+
+推荐文件名：
+
+~~~text
+BJC-001_rep1.jpg
+BJC-001_rep2.jpg
+BJC-001_rep3.jpg
+~~~
+
+以上图片会被识别为同一个 sample_id：BJC-001。
+
+下面这种命名也可以：
+
+~~~text
+BJC-001_1.jpg
+BJC-001_2.jpg
+~~~
+
+但如果名字没有明显的重复编号，例如 sample_A1.jpg，程序会保留完整文件名 sample_A1，避免错误地把不同样本合并。
+
+### 自定义样本编号提取规则
+
+如果文件名是：
+
+~~~text
+2026-BJC001-leaf-01.jpg
+2026-BJC001-leaf-02.jpg
+~~~
+
+可以使用正则表达式，并把第一个括号内的内容作为 sample_id：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.csv --method exg --id-pattern '(\d{4}-BJC\d+)'
+~~~
+
+如果不想合并重复图片，添加：
+
+~~~bash
+--no-aggregate
+~~~
+
+完整示例：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/per_image.csv --method exg --no-aggregate
+~~~
+
+---
+
+## 三、推荐的配置文件运行方式
+
+命令行适合快速试用；正式项目建议保存一份 config.yaml，以便日后复现实验。
+
+项目已经提供默认配置：
+
+~~~bash
+python scripts/batch_extract.py --config config.yaml --verbose
+~~~
+
+配置文件中的相对路径以 config.yaml 所在目录为准，不受当前终端目录影响。
+
+第一次使用时，主要检查这几项：
+
+~~~yaml
+input:
+  image_dir: "./data/raw_images/"
+  output_dir: "./output/"
+
+imaging:
+  white_balance: "gray_world"
+
+color_calibration:
+  enabled: false
+
+segmentation:
+  method: "exg"
+  device: "cpu"
+
+output:
+  format: "csv"
+  phenotype_table_name: "leaf_color_phenotypes"
+  separate_visualization: true
+~~~
+
+配置文件和命令行参数同时出现时，明确写在命令行里的参数优先。例如：
+
+~~~bash
+python scripts/batch_extract.py --config config.yaml --method grabcut --output output/grabcut_result.xlsx
+~~~
+
+这条命令只临时覆盖分割方法和输出文件，不会修改 config.yaml。
+
+---
+
+## 四、该选哪一种分割方法
+
+| 方法 | 是否需要模型 | 是否需要显卡 | 适合场景 |
+|---|---:|---:|---|
+| exg | 否 | 否 | 第一次使用；绿色叶片与背景差异明显 |
+| grabcut | 否 | 否 | 背景较复杂，但主要叶片位于画面中央 |
+| auto | 可选 | 否 | 有 U-Net 模型就优先用模型，否则自动选择传统方法 |
+| unet | 是 | 可选 | 已有同类图像训练出的 U-Net 权重 |
+| sam | 是 | 通常建议 | 已安装 segment-anything 并准备好 SAM 检查点 |
+
+### 推荐尝试顺序
+
+1. 先用 exg，并加上 --visualize 检查结果。
+2. 如果叶片漏分较多，尝试 grabcut。
+3. 如果传统方法在不同背景下不稳定，再标注数据并训练 U-Net。
+
+ExG：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/exg.csv --method exg --visualize
+~~~
+
+GrabCut：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/grabcut.csv --method grabcut --visualize
+~~~
+
+自动模式：
+
+~~~bash
+python scripts/batch_extract.py --config config.yaml --method auto
+~~~
+
+U-Net：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/unet.csv --method unet --model models/unet_cabbage.pth --device cpu --visualize
+~~~
+
+有可用的 NVIDIA CUDA 环境时，可把 --device cpu 改成 --device cuda。
+
+### 如果确实要使用 SAM
+
+SAM 不会随 requirements.txt 自动安装，需要单独安装：
+
+~~~bash
+python -m pip install git+https://github.com/facebookresearch/segment-anything.git
+~~~
+
+再准备与模型类型匹配的检查点。下面以 ViT-H 检查点为例：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/sam.csv --method sam --model models/sam_vit_h.pth --device cpu --visualize
+~~~
+
+使用其他 SAM 模型类型时，在 config.yaml 中同时写明 model_type 和检查点：
+
+~~~yaml
+segmentation:
+  method: "sam"
+  model_type: "vit_b"
+  model_path: "./models/sam_vit_b.pth"
+  device: "cpu"
+~~~
+
+---
+
+## 五、如何训练 U-Net
+
+只有在传统分割效果不够稳定时，才需要这一步。
+
+### 1. 准备训练图片和掩膜
+
+~~~text
+data/train/
+├── images/
+│   ├── leaf001.jpg
+│   ├── leaf002.jpg
+│   └── ...
+└── masks/
+    ├── leaf001.png
+    ├── leaf002.png
+    └── ...
+~~~
+
+要求：
+
+- 图片和掩膜的基本文件名必须一致。
+- 掩膜中叶片区域为白色或非零，背景为黑色或零。
+- 当前训练脚本读取文件夹配对数据，不直接读取 COCO 或 LabelMe 标注文件。
+
+### 2. 安装完整依赖
+
+~~~bash
+python -m pip install -r requirements.txt
+~~~
+
+### 3. 开始训练
+
+有 CUDA：
+
+~~~bash
+python scripts/train_segmentation.py --images data/train/images --masks data/train/masks --backbone efficientnet-b3 --epochs 100 --device cuda --output models/unet_cabbage.pth
+~~~
+
+只使用 CPU：
+
+~~~bash
+python scripts/train_segmentation.py --images data/train/images --masks data/train/masks --backbone efficientnet-b3 --epochs 100 --device cpu --output models/unet_cabbage.pth
+~~~
+
+CPU 训练通常很慢，建议先用较少图片和较少轮数确认流程可运行。
+
+### 4. 用训练好的模型批量提取
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/unet_result.csv --method unet --model models/unet_cabbage.pth --device cpu --visualize
+~~~
+
+---
+
+## 六、白平衡怎么选
+
+### gray_world：默认推荐
+
+~~~bash
+--white-balance gray_world
+~~~
+
+不需要额外数据，适合多数普通拍摄场景。
+
+### none：完全不校正
+
+~~~bash
+--white-balance none
+~~~
+
+只建议在图片已经完成统一、可靠的白平衡校正时使用。
+
+### perfect_reflector：高光反射法
+
+~~~bash
+--white-balance perfect_reflector
+~~~
+
+适合画面中存在接近白色区域的图片，但容易受过曝点影响。
+
+### gray_card：灰卡法
+
+灰卡法必须在 config.yaml 中提供灰卡区域的平均 RGB 值：
+
+~~~yaml
+imaging:
+  white_balance: "gray_card"
+  gray_card_rgb: [0.42, 0.40, 0.38]
+~~~
+
+三个值按 R、G、B 顺序填写，建议归一化到 0 到 1。
+
+如果只在命令行写 --white-balance gray_card，却没有提供 gray_card_rgb，程序会明确报错。
+
+---
+
+## 七、颜色校准是否需要开启
+
+### 不需要开启的情况
+
+- 只是想先跑通流程。
+- 图片来自同一相机、同一光源和同一批次。
+- 当前主要目标是比较同批样本的相对差异。
+
+此时保持：
+
+~~~yaml
+color_calibration:
+  enabled: false
+~~~
+
+### 建议开启的情况
+
+- 需要比较不同日期、不同相机或不同地点拍摄的数据。
+- 对绝对颜色值有较高要求。
+- 每批图片都拍摄了标准 ColorChecker 色卡。
+
+### 颜色校准的实际操作
+
+当前项目不会自动定位色卡色块。你需要使用图像软件或其他色卡识别工具，按参考色卡的固定顺序提取 24 个色块的平均 RGB。
+
+保存为 measured_rgb.npy，形状必须是 (24, 3)，数值应为 0 到 1。然后运行：
+
+~~~python
+from pathlib import Path
+
+import numpy as np
+
 from src.preprocessing import ImagePreprocessor
 
-# 1. 拍摄含ColorChecker色卡的参考图像
-# 2. 用色卡工具或人工标注提取24个色块的RGB均值，保存为 (24,3) 数组
-import numpy as np
-measured_rgb = np.load("data/colorchecker/measured_rgb.npy")
+measured = np.load("measured_rgb.npy").astype(np.float32)
+if measured.max() > 1.0:
+    measured = measured / 255.0
 
-# 3. 计算颜色校正矩阵
-preprocessor = ImagePreprocessor(calibration_method="polynomial", polynomial_degree=2)
-ccm = preprocessor.compute_color_correction_matrix(measured_rgb)
+if measured.shape != (24, 3):
+    raise ValueError("measured_rgb.npy 必须是 24 行、3 列")
 
-# 保存 CCM，供批处理配置复用
-np.save("models/colorchecker_ccm.npy", ccm)
+calibrator = ImagePreprocessor(
+    calibration_method="polynomial",
+    polynomial_degree=2,
+)
+matrix = calibrator.compute_color_correction_matrix(
+    measured_rgb=measured,
+)
 
-# 4. 对后续所有图像应用相同的CCM
-corrected = preprocessor.apply_color_correction(some_image)
-```
+Path("models").mkdir(parents=True, exist_ok=True)
+np.save("models/colorchecker_ccm.npy", matrix)
+~~~
 
-批处理配置：
+然后修改 config.yaml：
 
-```yaml
+~~~yaml
 color_calibration:
   enabled: true
-  method: polynomial
-  polynomial_degree: 2
-  ccm_file: models/colorchecker_ccm.npy
-```
+  method: "polynomial"
+  degree: 2
+  ccm_file: "./models/colorchecker_ccm.npy"
+~~~
 
-`ccm_file` 相对于配置文件所在目录解析。若不需要跨批次比较，可保持
-`enabled: false`，但输出应明确记录这一实验条件。
+如果 enabled 为 true，但没有提供有效的 matrix 或 ccm_file，程序会在启动时停止并说明原因，不会悄悄跳过校准。
 
-## 批处理失败策略
+支持的 CCM 文件格式包括 NPY、JSON、YAML 和 CSV。
 
-批处理会继续检查剩余图像，同时在输出目录写入 `*_failures.csv`。只要存在
-失败图像，命令行默认返回非零状态，防止不完整表型表被误当作完整结果；只有
-明确接受部分结果时才使用 `--allow-partial`。
+---
 
-## GWAS分析衔接
+## 八、输出文件怎么看
 
-生成的表型表可直接对接 GWAS 分析:
+### 1. 每张图片的基础特征
 
-```r
-# R 代码示例 — GWAS分析衔接
-pheno <- read.csv("phenotypes.csv", row.names = 1)
+常见列包括：
 
-# Step 1: 计算BLUP (消除环境/重复效应)
-library(lme4)
-blup_model <- lmer(CIELAB_A_mean ~ (1|sample_id) + developmental_stage, data = pheno)
-blups <- ranef(blup_model)$sample_id
+- sample_id：样本编号。
+- image_path：原始图片路径。
+- CIELAB_L_mean、CIELAB_a_mean、CIELAB_b_mean：叶片区域的 CIELAB 均值。
+- HSV_H_mean、HSV_S_mean、HSV_V_mean：HSV 颜色统计。
+- ExG、ExR、GLI、NGRDI、VARI、CIVE、DGCI、COM：植被指数。
+- GLCM、LBP、Gabor：纹理特征。
+- QC_mask_area_px：叶片掩膜像素数。
+- QC_mask_area_ratio：叶片面积占整张图片的比例。
+- QC_empty_mask：是否没有分割出叶片。
+- QC_bbox_x、QC_bbox_y、QC_bbox_w、QC_bbox_h：叶片外接框。
 
-# Step 2: 计算广义遗传力
-# H² = Vg / (Vg + Ve/n)
+实际列数会随 config.yaml 中启用的特征组变化。
 
-# Step 3: 输入GAPIT3
-# myGAPIT <- GAPIT(Y = blups, G = geno, PCA.total = 3, model = "FarmCPU")
-```
+### 2. 重复图片聚合后的列名
 
-## 引用
+假设原始单图列为 CIELAB_L_mean：
 
-如果使用本工具包, 请引用相关方法文献 (详见各模块文档字符串中的文献引用)。
+- CIELAB_L_mean：重复图片之间的均值，保留原列名。
+- CIELAB_L_mean_rep_std：重复图片之间的标准差。
+- CIELAB_L_mean_rep_cv：重复图片之间的变异系数。
+- n_replicates：该样本包含的图片数量。
 
-## License
+这里要区分：
 
-MIT License
+- 原列名中的 mean 或 std，是单张图片内部叶片像素的统计量。
+- rep_std 和 rep_cv，是同一样本多张重复图片之间的统计量。
+
+当重复均值非常接近 0 时，rep_cv 会留空，避免产生无意义的极大值或无穷值。
+
+### 3. 输出为 Excel 或 JSON
+
+Excel：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.xlsx --method exg
+~~~
+
+JSON：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.json --method exg
+~~~
+
+CSV：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.csv --method exg
+~~~
+
+程序根据输出文件扩展名选择格式。
+
+---
+
+## 九、如何判断一批数据是否处理成功
+
+建议按下面顺序检查：
+
+1. 终端最后是否显示成功和失败图片数量。
+2. 输出表中行数是否与预期样本数一致。
+3. n_replicates 是否与每个样本的重复图片数一致。
+4. 随机抽查 visualizations 中至少 10% 的图片。
+5. 查看 QC_empty_mask 是否为 True。
+6. 检查 QC_mask_area_ratio 是否异常小或异常大。
+7. 查看 rep_cv 特别大的样本，并回到原图检查。
+
+如果部分图片失败，程序会生成：
+
+~~~text
+output/leaf_color_phenotypes_failures.csv
+~~~
+
+其中会记录失败图片和错误原因。
+
+默认情况下，只要有图片失败，命令就会返回非零状态，方便自动化流程发现问题。确认可以接受不完整结果时，才添加：
+
+~~~bash
+--allow-partial
+~~~
+
+例如：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.csv --method exg --allow-partial
+~~~
+
+---
+
+## 十、常见问题
+
+### 问题 1：提示 No images found
+
+检查：
+
+- 当前是否位于 leaf_color_phenotyping 目录。
+- --input 后面的目录是否真实存在。
+- 图片扩展名是否受支持。
+- config.yaml 中的相对路径是否写对。
+
+可以先执行：
+
+~~~powershell
+Get-ChildItem data\raw_images
+~~~
+
+macOS 或 Linux：
+
+~~~bash
+ls data/raw_images
+~~~
+
+### 问题 2：提示 ModuleNotFoundError
+
+确认虚拟环境已启用，然后重新安装基础依赖：
+
+~~~bash
+python -m pip install numpy opencv-python scikit-image pandas PyYAML openpyxl
+~~~
+
+如果报错来自 torch、segmentation_models_pytorch 或 albumentations，说明正在使用 U-Net 相关功能，需要：
+
+~~~bash
+python -m pip install -r requirements.txt
+~~~
+
+### 问题 3：U-Net 提示找不到模型
+
+检查 --model 路径是否存在。尚未训练模型时，先改用：
+
+~~~bash
+--method exg
+~~~
+
+### 问题 4：CUDA 不可用
+
+把设备改成 CPU：
+
+~~~bash
+--device cpu
+~~~
+
+### 问题 5：叶片和背景分不开
+
+依次尝试：
+
+1. 加 --visualize 确认问题位置。
+2. 从 exg 改为 grabcut。
+3. 改善拍摄背景和光照。
+4. 标注一批同类图片并训练 U-Net。
+
+### 问题 6：开启颜色校准后立刻报错
+
+这是保护机制。请确认：
+
+- ccm_file 指向真实文件。
+- 文件内矩阵形状正确。
+- 多项式校准的矩阵行数与 degree 匹配。
+- measured RGB 与参考色卡的 24 色顺序一致。
+
+### 问题 7：Excel 打开 CSV 时路径或中文显示异常
+
+直接输出 XLSX：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.xlsx --method exg
+~~~
+
+### 问题 8：PowerShell 不允许启用虚拟环境
+
+只对当前 PowerShell 会话临时放行：
+
+~~~powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\.venv\Scripts\Activate.ps1
+~~~
+
+---
+
+## 十一、正式用于 GWAS 前的建议
+
+建议保留两个版本的数据：
+
+1. 使用 --no-aggregate 导出的逐图片数据，用于检查重复间差异。
+2. 默认聚合后的逐样本数据，用于与基因型和试验设计表合并。
+
+R 中可先读取结果：
+
+~~~r
+library(data.table)
+
+pheno <- fread("output/leaf_color_phenotypes.csv")
+geno  <- fread("genotypes.csv")
+meta  <- fread("experimental_metadata.csv")
+
+dat <- merge(pheno, meta, by = "sample_id")
+dat <- merge(dat, geno, by = "sample_id")
+~~~
+
+批次、区组、时期、地点和处理等实验信息应来自你的试验设计表，再按 sample_id 合并。不要把文件名解析当成完整的试验设计数据。
+
+正式分析前还应：
+
+- 保存原始图片，不覆盖。
+- 保存本次 config.yaml。
+- 记录相机、镜头、光源和曝光设置。
+- 不同拍摄批次分别检查白平衡与颜色校准。
+- 根据 QC 列和分割图排除失败图片。
+- 检查极端值和重复间变异。
+
+---
+
+## 十二、运行自动测试
+
+如果你修改了代码，建议先安装测试依赖：
+
+~~~bash
+python -m pip install -r requirements-dev.txt
+~~~
+
+然后运行：
+
+~~~bash
+python -m pytest
+~~~
+
+测试覆盖颜色空间转换、植被指数、分割基础用例、样本聚合、配置初始化和输出格式等关键路径。
+
+---
+
+## 十三、项目目录说明
+
+~~~text
+leaf_color_phenotyping/
+├── config.yaml                 # 主配置文件
+├── requirements.txt            # 完整运行和训练依赖
+├── requirements-dev.txt        # 轻量测试依赖
+├── scripts/
+│   ├── batch_extract.py        # 批量提取入口
+│   └── train_segmentation.py   # U-Net 训练入口
+├── src/
+│   ├── pipeline.py             # 主处理流程
+│   ├── segmentation.py         # ExG、GrabCut、U-Net 和 SAM
+│   ├── preprocessing.py        # 图片读取、白平衡和颜色校准
+│   ├── color_features.py       # 颜色特征
+│   ├── vegetation_indices.py   # 植被指数
+│   ├── texture_features.py     # 纹理特征
+│   └── utils.py                # 文件、颜色空间和统计工具
+├── tests/                      # 自动测试
+├── data/
+│   ├── raw_images/             # 待处理图片
+│   └── train/                  # 可选训练数据
+├── models/                     # 可选模型和 CCM
+└── output/                     # 输出表和可视化
+~~~
+
+---
+
+## 十四、最常用命令速查
+
+最简单的 CPU 处理：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.csv --method exg
+~~~
+
+同时保存分割图：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/result.csv --method exg --visualize
+~~~
+
+使用配置文件：
+
+~~~bash
+python scripts/batch_extract.py --config config.yaml --verbose
+~~~
+
+保留每张图片，不聚合：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/per_image.csv --method exg --no-aggregate
+~~~
+
+使用 U-Net：
+
+~~~bash
+python scripts/batch_extract.py --input data/raw_images --output output/unet.csv --method unet --model models/unet_cabbage.pth --device cpu
+~~~
+
+运行测试：
+
+~~~bash
+python -m pytest
+~~~
+
+---
+
+## 许可证
+
+本项目使用 MIT License，详见 LICENSE。

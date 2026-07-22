@@ -1,4 +1,7 @@
 # 大白菜叶色表型提取
 
-项目代码、安装说明和使用文档见
-[`leaf_color_phenotyping/README.md`](leaf_color_phenotyping/README.md)。
+第一次使用，请直接打开：
+
+## [从零开始操作指南](leaf_color_phenotyping/README.md)
+
+指南按照“安装环境 → 放置图片 → 复制命令 → 检查结果 → 处理报错”的顺序编写，并包含传统分割、U-Net、白平衡、颜色校准和 GWAS 数据准备说明。
