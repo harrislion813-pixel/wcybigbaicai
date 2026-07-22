@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-deps/
+.coverage
+htmlcov/
+.venv/
+venv/
+leaf_color_phenotyping/output/
+leaf_color_phenotyping/models/*.pth

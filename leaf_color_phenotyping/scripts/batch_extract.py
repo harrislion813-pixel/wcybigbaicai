@@ -44,20 +44,20 @@ def parse_args():
     parser.add_argument("--input", "-i", type=str, default=None,
                         help="输入图像目录")
     parser.add_argument("--output", "-o", type=str, default=None,
-                        help="输出CSV文件路径")
+                        help="输出文件路径（CSV/JSON/Excel）")
     parser.add_argument("--method", "-m", type=str,
                         choices=["exg", "grabcut", "unet", "sam", "auto"],
-                        default="exg",
-                        help="叶片分割方法 (default: exg)")
+                        default=None,
+                        help="叶片分割方法（未指定时读取配置，默认 exg）")
     parser.add_argument("--model", type=str, default=None,
                         help="U-Net/SAM模型权重路径")
-    parser.add_argument("--device", type=str, default="cpu",
+    parser.add_argument("--device", type=str, default=None,
                         choices=["cpu", "cuda"],
-                        help="计算设备 (default: cpu)")
+                        help="计算设备（未指定时读取配置，默认 cpu）")
     parser.add_argument("--white-balance", "-wb", type=str,
-                        default="gray_world",
-                        choices=["gray_world", "perfect_reflector", "none"],
-                        help="白平衡方法 (default: gray_world)")
+                        default=None,
+                        choices=["gray_world", "perfect_reflector", "gray_card", "none"],
+                        help="白平衡方法（未指定时读取配置，默认 gray_world）")
     parser.add_argument("--id-pattern", type=str, default=None,
                         help="样本ID正则提取模式 (e.g. '(\\\\w+)_rep')")
     parser.add_argument("--no-aggregate", action="store_true",
@@ -66,6 +66,8 @@ def parse_args():
                         help="为每张图像生成可视化结果并保存")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="显示详细进度")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="即使部分图像处理失败，也以成功状态退出")
 
     return parser.parse_args()
 
@@ -76,14 +78,17 @@ def main():
     # ---- 加载配置 ----
     config = {}
     if args.config:
-        with open(args.config, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
+        config_path = Path(args.config).resolve()
+        with config_path.open("r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        config["_config_dir"] = str(config_path.parent)
         print(f"Loaded config from: {args.config}")
     else:
         # 默认配置
         config = {
             "segmentation": {
-                "method": args.method,
+                "method": args.method or "exg",
+                "device": args.device or "cpu",
             },
             "output": {
                 "format": "csv",
@@ -91,23 +96,47 @@ def main():
             },
         }
         if args.model:
-            config["segmentation"]["model_path"] = args.model
-            config["segmentation"]["device"] = args.device
+            config["segmentation"]["model_path"] = str(Path(args.model).resolve())
 
     # ---- 命令行参数覆盖 ----
     if args.method:
         config.setdefault("segmentation", {})["method"] = args.method
     if args.model:
-        config.setdefault("segmentation", {})["model_path"] = args.model
-        config["segmentation"]["device"] = args.device
+        config.setdefault("segmentation", {})["model_path"] = str(Path(args.model).resolve())
+    if args.device:
+        config.setdefault("segmentation", {})["device"] = args.device
 
     # ---- 输入输出 ----
-    input_dir = args.input or config.get("input", {}).get("image_dir", "./data/raw_images/")
+    config_dir = Path(config.get("_config_dir", "."))
+    configured_input = config.get("input", {}).get("image_dir", "./data/raw_images/")
+    if args.input:
+        input_dir = args.input
+    else:
+        input_path = Path(configured_input)
+        input_dir = str(input_path if input_path.is_absolute() else config_dir / input_path)
     output_csv = args.output
 
     if not output_csv:
         output_dir = config.get("input", {}).get("output_dir", "./output/")
-        output_csv = str(Path(output_dir) / "leaf_color_phenotypes.csv")
+        output_dir_path = Path(output_dir)
+        if not output_dir_path.is_absolute():
+            output_dir_path = config_dir / output_dir_path
+        output_cfg = config.get("output", {})
+        output_format = str(output_cfg.get("format", "csv")).lower()
+        extension = {"csv": ".csv", "excel": ".xlsx", "json": ".json"}.get(output_format)
+        if extension is None:
+            raise ValueError("output.format must be one of: csv, excel, json")
+        table_name = output_cfg.get("phenotype_table_name", "leaf_color_phenotypes")
+        output_csv = str(output_dir_path / f"{table_name}{extension}")
+
+    effective_method = config.get("segmentation", {}).get("method", "exg")
+    effective_white_balance = (
+        args.white_balance or config.get("imaging", {}).get("white_balance", "gray_world")
+    )
+    gray_roi = config.get("imaging", {}).get("gray_card_rgb")
+    save_visualizations = (
+        args.visualize or config.get("output", {}).get("separate_visualization", False)
+    )
 
     # ---- 运行流水线 ----
     print("=" * 60)
@@ -115,8 +144,8 @@ def main():
     print("=" * 60)
     print(f"  Input:        {input_dir}")
     print(f"  Output:       {output_csv}")
-    print(f"  Segmentation: {args.method}")
-    print(f"  White balance: {args.white_balance}")
+    print(f"  Segmentation: {effective_method}")
+    print(f"  White balance: {effective_white_balance}")
     print(f"  Aggregate:    {not args.no_aggregate}")
     print("=" * 60)
 
@@ -126,14 +155,21 @@ def main():
         output_csv=output_csv,
         id_pattern=args.id_pattern,
         group_by_sample=not args.no_aggregate,
-        white_balance=args.white_balance,
-        save_visualizations=args.visualize,
+        white_balance=effective_white_balance,
+        gray_roi=gray_roi,
+        save_visualizations=save_visualizations,
         verbose=args.verbose,
     )
 
     if df.empty:
         print("\n[WARNING] No phenotypes extracted. Check your input directory.")
         return 1
+
+    if pipeline.last_batch_failures:
+        print(f"\n[ERROR] {len(pipeline.last_batch_failures)} image(s) failed.")
+        if not args.allow_partial:
+            print("Use --allow-partial to accept an incomplete phenotype table.")
+            return 2
 
     # ---- 输出摘要 ----
     print("\n" + "=" * 60)

@@ -6,6 +6,7 @@
 """
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
+import json
 
 import numpy as np
 import cv2
@@ -36,6 +37,58 @@ class ImagePreprocessor:
         self.calibration_method = calibration_method
         self.polynomial_degree = polynomial_degree
         self._ccm: Optional[np.ndarray] = None  # 颜色校正矩阵
+
+    @property
+    def has_color_correction_matrix(self) -> bool:
+        """Whether a validated color-correction matrix is available."""
+        return self._ccm is not None
+
+    def set_color_correction_matrix(self, matrix: np.ndarray) -> np.ndarray:
+        """Validate and install a precomputed color-correction matrix."""
+        matrix = np.asarray(matrix, dtype=np.float64)
+        if self.calibration_method == "linear":
+            expected_shape = (3, 3)
+        elif self.calibration_method == "polynomial":
+            n_terms = self._expand_polynomial(
+                np.zeros((1, 3), dtype=np.float64), self.polynomial_degree
+            ).shape[1]
+            expected_shape = (n_terms, 3)
+        else:
+            raise ValueError(f"Unknown calibration method: {self.calibration_method}")
+
+        if matrix.shape != expected_shape:
+            raise ValueError(
+                f"CCM shape {matrix.shape} does not match {self.calibration_method} "
+                f"calibration; expected {expected_shape}"
+            )
+        if not np.isfinite(matrix).all():
+            raise ValueError("CCM contains NaN or infinite values")
+        self._ccm = matrix
+        return self._ccm
+
+    def load_color_correction_matrix(self, path: str) -> np.ndarray:
+        """Load a CCM from .npy, JSON, YAML, or delimited text."""
+        ccm_path = Path(path)
+        if not ccm_path.is_file():
+            raise FileNotFoundError(f"颜色校正矩阵文件不存在: {ccm_path}")
+
+        suffix = ccm_path.suffix.lower()
+        if suffix == ".npy":
+            matrix = np.load(ccm_path, allow_pickle=False)
+        elif suffix == ".json":
+            with ccm_path.open("r", encoding="utf-8") as handle:
+                matrix = json.load(handle)
+        elif suffix in (".yaml", ".yml"):
+            try:
+                import yaml
+            except ImportError as exc:
+                raise ImportError("读取 YAML CCM 需要安装 PyYAML") from exc
+            with ccm_path.open("r", encoding="utf-8") as handle:
+                matrix = yaml.safe_load(handle)
+        else:
+            matrix = np.loadtxt(ccm_path, delimiter="," if suffix == ".csv" else None)
+
+        return self.set_color_correction_matrix(matrix)
 
     # ----------------------------------------------------------
     # RAW 文件读取 (依赖 rawpy)
@@ -183,11 +236,11 @@ class ImagePreprocessor:
             A = src  # (N, 3)
             # 最小二乘: M = A^-1 @ dst
             M, _, _, _ = np.linalg.lstsq(A, dst, rcond=None)
-            self._ccm = M  # (3, 3)
+            self.set_color_correction_matrix(M)
         elif self.calibration_method == "polynomial":
             A = self._expand_polynomial(src, self.polynomial_degree)
             M, _, _, _ = np.linalg.lstsq(A, dst, rcond=None)
-            self._ccm = M  # (K, 3)
+            self.set_color_correction_matrix(M)
         else:
             raise ValueError(f"Unknown calibration method: {self.calibration_method}")
 
@@ -252,8 +305,15 @@ class ImagePreprocessor:
             img = self.white_balance_gray_world(img)
         elif white_balance_method == "perfect_reflector":
             img = self.white_balance_perfect_reflector(img)
-        elif white_balance_method == "gray_card" and gray_roi is not None:
+        elif white_balance_method == "gray_card":
+            if gray_roi is None:
+                raise ValueError("white_balance_method='gray_card' requires gray_roi RGB values")
+            gray_roi = np.asarray(gray_roi, dtype=np.float32)
+            if gray_roi.shape != (3,) or not np.isfinite(gray_roi).all():
+                raise ValueError("gray_roi must contain exactly three finite RGB values")
             img = self.white_balance_gray_card(img, gray_roi)
+        elif white_balance_method != "none":
+            raise ValueError(f"Unknown white balance method: {white_balance_method}")
 
         # Step 3: 颜色校正
         if apply_ccm and self._ccm is not None:

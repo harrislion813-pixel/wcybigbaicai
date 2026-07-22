@@ -23,8 +23,9 @@ import numpy as np
 class VegetationIndexExtractor:
     """基于RGB的植被指数计算器.
 
-    所有指数均使用归一化RGB (r,g,b = R,G,B / (R+G+B))
-    以消除光照强度影响, 仅保留颜色信息.
+    输入统一为 float RGB [0,1]。比例型指数直接使用该范围；
+    ExG/ExR/ExGR 在公式内部使用色度归一化值；CIVE 按原始
+    8-bit RGB 公式计算，以保持公式系数与输入尺度一致。
 
     Usage:
         vie = VegetationIndexExtractor()
@@ -38,10 +39,11 @@ class VegetationIndexExtractor:
                      可选: VARI, GLI, ExG, ExR, ExGR, NGRDI, DGCI,
                            CIVE, MGRVI, RGBVI, NDI, VEG, COM
         """
-        self.indices = indices or [
+        default_indices = [
             "VARI", "GLI", "ExG", "ExR", "ExGR", "NGRDI", "DGCI",
             "CIVE", "MGRVI", "RGBVI", "NDI", "VEG", "COM"
         ]
+        self.indices = default_indices if indices is None else list(indices)
         self._compute_fn = {
             "VARI": self._vari,
             "GLI": self._gli,
@@ -200,10 +202,12 @@ class VegetationIndexExtractor:
     @staticmethod
     def _cive(R, G, B):
         """CIVE: Color Index of Vegetation Extraction.
-        CIVE = 0.441*R - 0.811*G + 0.385*B + 18.78745
+        CIVE = 0.441*R8 - 0.811*G8 + 0.385*B8 + 18.78745,
+        其中 R8/G8/B8 为 [0,255] 的 8-bit 等价值。
         文献: Kataoka et al. (2003)
         """
-        return 0.441 * R - 0.811 * G + 0.385 * B + 18.78745
+        return (0.441 * (R * 255.0) - 0.811 * (G * 255.0) +
+                0.385 * (B * 255.0) + 18.78745)
 
     @staticmethod
     def _mgrvi(R, G, B):
@@ -248,7 +252,8 @@ class VegetationIndexExtractor:
         exg = 2 * g - r - b
         exr = 1.4 * r - g
         exgr = exg - exr
-        cive = 0.441 * R - 0.811 * G + 0.385 * B + 18.78745
+        cive = (0.441 * (R * 255.0) - 0.811 * (G * 255.0) +
+                0.385 * (B * 255.0) + 18.78745)
         a = 0.667
         veg = G / (R**a * B**(1 - a) + 1e-10)
         return exg + cive + exgr + veg

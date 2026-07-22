@@ -8,8 +8,7 @@
 """
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from collections import defaultdict
+from typing import Dict, List, Optional
 
 import numpy as np
 import cv2
@@ -58,6 +57,14 @@ class LeafColorPipeline:
         """
         self.config = config or {}
 
+        imaging = self.config.get("imaging", {})
+        self.default_white_balance = imaging.get("white_balance", "gray_world")
+        gray_card_rgb = imaging.get("gray_card_rgb")
+        self.default_gray_roi = (
+            np.asarray(gray_card_rgb, dtype=np.float32)
+            if gray_card_rgb is not None else None
+        )
+
         # ---- 初始化各模块 ----
         self.preprocessor = self._init_preprocessor()
         self.segmenter = self._init_segmenter()
@@ -69,13 +76,38 @@ class LeafColorPipeline:
 
         # ---- 输出配置 ----
         output = self.config.get("output", {})
-        self.output_format = output.get("format", "csv")
+        self.output_format = str(output.get("format", "csv")).lower()
+        if self.output_format not in {"csv", "excel", "json"}:
+            raise ValueError("output.format must be one of: csv, excel, json")
+        self.output_table_name = output.get("phenotype_table_name", "leaf_color_phenotypes")
+        self.default_save_visualizations = output.get("separate_visualization", False)
+        self.last_batch_failures: List[Dict[str, str]] = []
 
     def _init_preprocessor(self) -> ImagePreprocessor:
         calib = self.config.get("color_calibration", {})
-        return ImagePreprocessor(
+        preprocessor = ImagePreprocessor(
             calibration_method=calib.get("method", "polynomial"),
             polynomial_degree=calib.get("polynomial_degree", 2),
+        )
+        if not calib.get("enabled", False):
+            return preprocessor
+
+        if calib.get("matrix") is not None:
+            preprocessor.set_color_correction_matrix(calib["matrix"])
+            return preprocessor
+
+        ccm_file = calib.get("ccm_file")
+        if ccm_file:
+            ccm_path = Path(ccm_file)
+            if not ccm_path.is_absolute():
+                config_dir = Path(self.config.get("_config_dir", "."))
+                ccm_path = config_dir / ccm_path
+            preprocessor.load_color_correction_matrix(str(ccm_path))
+            return preprocessor
+
+        raise ValueError(
+            "color_calibration.enabled=true requires color_calibration.matrix "
+            "or color_calibration.ccm_file"
         )
 
     def _init_segmenter(self) -> BaseSegmenter:
@@ -86,6 +118,14 @@ class LeafColorPipeline:
             if key == "method":
                 continue
             kwargs[_SEGMENTATION_ALIASES.get(key, key)] = value
+        if method == "sam" and "model_path" in kwargs and "sam_checkpoint" not in kwargs:
+            kwargs["sam_checkpoint"] = kwargs.pop("model_path")
+        model_key = "sam_checkpoint" if method == "sam" else "model_path"
+        if kwargs.get(model_key):
+            model_path = Path(kwargs[model_key])
+            if not model_path.is_absolute():
+                model_path = Path(self.config.get("_config_dir", ".")) / model_path
+            kwargs[model_key] = str(model_path)
         return create_segmenter(method, **kwargs)
 
     def _init_color_extractor(self) -> ColorFeatureExtractor:
@@ -138,7 +178,8 @@ class LeafColorPipeline:
                        replicate: Optional[str] = None,
                        developmental_stage: Optional[str] = None,
                        metadata: Optional[Dict] = None,
-                       white_balance: str = "gray_world",
+                       white_balance: Optional[str] = None,
+                       gray_roi: Optional[np.ndarray] = None,
                        return_visualization: bool = False
                        ) -> Dict[str, object]:
         """处理单张叶片图像, 提取完整叶色表型.
@@ -175,8 +216,10 @@ class LeafColorPipeline:
 
         # ---- Step 1: 预处理 ----
         img_path = Path(image_path)
+        wb_method = white_balance or self.default_white_balance
+        wb_gray_roi = gray_roi if gray_roi is not None else self.default_gray_roi
         preprocessed = self.preprocessor.process(
-            str(img_path), white_balance_method=white_balance
+            str(img_path), white_balance_method=wb_method, gray_roi=wb_gray_roi
         )
         img_rgb = preprocessed["rgb"]
         img_uint8 = preprocessed["rgb_uint8"]
@@ -246,8 +289,9 @@ class LeafColorPipeline:
                       output_csv: Optional[str] = None,
                       id_pattern: Optional[str] = None,
                       group_by_sample: bool = True,
-                      white_balance: str = "gray_world",
-                      save_visualizations: bool = False,
+                      white_balance: Optional[str] = None,
+                      gray_roi: Optional[np.ndarray] = None,
+                      save_visualizations: Optional[bool] = None,
                       visualization_dir: Optional[str] = None,
                       verbose: bool = True) -> pd.DataFrame:
         """批量处理目录下的所有图像.
@@ -265,6 +309,9 @@ class LeafColorPipeline:
             DataFrame: 表型表
         """
         img_paths = find_images(image_dir)
+        if save_visualizations is None:
+            save_visualizations = self.default_save_visualizations
+        self.last_batch_failures = []
         if verbose:
             print(f"Found {len(img_paths)} images in {image_dir}")
 
@@ -294,6 +341,7 @@ class LeafColorPipeline:
                     str(img_path),
                     sample_id=sid,
                     white_balance=white_balance,
+                    gray_roi=gray_roi,
                     return_visualization=save_visualizations,
                 )
                 if save_visualizations and vis_dir is not None and "visualization" in result:
@@ -303,34 +351,57 @@ class LeafColorPipeline:
                 records.append(result)
             except Exception as e:
                 print(f"  ERROR processing {img_path.name}: {e}")
+                self.last_batch_failures.append({
+                    "image_path": str(img_path),
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                })
                 continue
 
         if not records:
+            if self.last_batch_failures and (output_csv or output_dir):
+                base_path = Path(output_csv or str(
+                    Path(output_dir or ".") / self.output_table_name
+                ))
+                if not base_path.suffix:
+                    base_path = base_path.with_suffix(".csv")
+                failure_path = base_path.with_name(f"{base_path.stem}_failures.csv")
+                safe_mkdir(failure_path.parent)
+                pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
+                print(f"Failure report saved to: {failure_path}")
             return pd.DataFrame()
 
         # 构建DataFrame
         rows = []
+        trait_columns = set()
         for rec in records:
             row = {"sample_id": rec["sample_id"],
                    "image_path": rec["image_path"]}
+            for key in ("replicate", "developmental_stage"):
+                if key in rec:
+                    row[key] = rec[key]
             row.update(rec.get("metadata") or {})
             row.update(rec["features"])
+            trait_columns.update(rec["features"].keys())
             rows.append(row)
 
         df = pd.DataFrame(rows)
 
         # 按样本ID汇总 (多重复/)
         if group_by_sample:
-            df = self._aggregate_by_sample(df)
+            df = self._aggregate_by_sample(df, trait_columns=sorted(trait_columns))
 
         # 保存
         if output_csv or output_dir:
-            csv_path = output_csv or str(
-                Path(output_dir or ".") / "leaf_color_phenotypes.csv"
+            output_path = output_csv or str(
+                Path(output_dir or ".") / self.output_table_name
             )
-            safe_mkdir(Path(csv_path).parent)
-            df.to_csv(csv_path, index=False)
-            print(f"\nPhenotype table saved to: {csv_path}")
+            output_path = self._save_table(df, output_path)
+            if self.last_batch_failures:
+                failure_path = output_path.with_name(f"{output_path.stem}_failures.csv")
+                pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
+                print(f"  Failure report saved to: {failure_path}")
+            print(f"\nPhenotype table saved to: {output_path}")
             print(f"  Shape: {df.shape[0]} samples × {df.shape[1]} traits")
 
         return df
@@ -394,14 +465,18 @@ class LeafColorPipeline:
             ]
 
         if not trait_columns:
-            return df.groupby("sample_id", as_index=False).first()
+            groupby = df.groupby("sample_id", dropna=False, sort=True)
+            grouped = groupby.first()
+            grouped["n_replicates"] = groupby.size()
+            return grouped.reset_index()
 
-        # 分组聚合
-        agg_dict = {}
-        for col in trait_columns:
-            agg_dict[col] = ["mean", "std"]
+        missing_traits = [col for col in trait_columns if col not in df.columns]
+        if missing_traits:
+            raise ValueError(f"Unknown trait columns: {missing_traits}")
 
-        grouped = df.groupby("sample_id").agg(agg_dict)
+        groupby = df.groupby("sample_id", dropna=False, sort=True)
+        agg_dict = {col: ["mean", "std"] for col in trait_columns}
+        grouped = groupby.agg(agg_dict)
 
         # 扁平化列名. Keep per-image feature names intact; add rep_* for replicate stats
         grouped.columns = [
@@ -415,17 +490,56 @@ class LeafColorPipeline:
             mean_col = col
             std_col = f"{col}_rep_std"
             if mean_col in grouped.columns and std_col in grouped.columns:
+                denominator = grouped[mean_col].abs()
                 cv_columns[f"{col}_rep_cv"] = (
-                    grouped[std_col] / (grouped[mean_col].abs() + 1e-10)
+                    grouped[std_col] / denominator.where(denominator > 1e-10)
                 )
         if cv_columns:
             grouped = pd.concat([grouped, pd.DataFrame(cv_columns, index=grouped.index)], axis=1)
 
         # 添加重复数
-        n_replicates = df.groupby("sample_id").size().rename("n_replicates")
+        n_replicates = groupby.size().rename("n_replicates")
         grouped = pd.concat([grouped, n_replicates], axis=1).copy()
 
+        # 保留图像路径、发育阶段和用户元数据等非性状列。
+        metadata_columns = [
+            col for col in df.columns
+            if col != "sample_id" and col not in trait_columns
+        ]
+        if metadata_columns:
+            grouped = grouped.join(groupby[metadata_columns].first())
+
         return grouped.reset_index()
+
+    def _save_table(self, df: pd.DataFrame, output_path: str) -> Path:
+        """Save a phenotype table using the configured or explicit file format."""
+        path = Path(output_path)
+        suffix_to_format = {
+            ".csv": "csv",
+            ".xlsx": "excel",
+            ".xls": "excel",
+            ".json": "json",
+        }
+        output_format = suffix_to_format.get(path.suffix.lower(), self.output_format)
+        if path.suffix and path.suffix.lower() not in suffix_to_format:
+            raise ValueError(
+                f"Unsupported output extension '{path.suffix}'; use .csv, .json, .xlsx, or .xls"
+            )
+        if not path.suffix:
+            extension = {"csv": ".csv", "excel": ".xlsx", "json": ".json"}[output_format]
+            path = path.with_suffix(extension)
+
+        safe_mkdir(path.parent)
+        if output_format == "csv":
+            df.to_csv(path, index=False)
+        elif output_format == "json":
+            df.to_json(path, orient="records", indent=2, force_ascii=False)
+        else:
+            try:
+                df.to_excel(path, index=False)
+            except ImportError as exc:
+                raise ImportError("Excel output requires openpyxl>=3.1") from exc
+        return path
 
     # ----------------------------------------------------------
     # 可视化

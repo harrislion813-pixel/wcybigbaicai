@@ -47,9 +47,11 @@ class ColorFeatureExtractor:
             include_histogram: 是否提取直方图特征
             include_chromaticity: 是否提取色度坐标特征
         """
-        self.color_spaces = color_spaces or ["RGB", "HSV", "CIELAB", "YCbCr"]
+        self.color_spaces = (["RGB", "HSV", "CIELAB", "YCbCr"]
+                             if color_spaces is None else list(color_spaces))
         self.hist_bins = hist_bins
-        self.hist_percentiles = hist_percentiles or [10, 25, 50, 75, 90]
+        self.hist_percentiles = ([10, 25, 50, 75, 90]
+                                 if hist_percentiles is None else list(hist_percentiles))
         self.include_color_moments = include_color_moments
         self.include_histogram = include_histogram
         self.include_chromaticity = include_chromaticity

@@ -16,11 +16,7 @@
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import cv2
-from skimage.feature import graycomatrix
-try:
-    from skimage.feature import graycoprops as graycoprop
-except ImportError:
-    from skimage.feature import graycoprop
+from skimage.feature import graycomatrix, graycoprops
 
 
 class GLCMTextureExtractor:
@@ -46,14 +42,15 @@ class GLCMTextureExtractor:
             levels: 灰度级数 (通常256, 可降为64加速)
             properties: 要计算的属性列表
         """
-        self.distances = distances or [1, 3, 5]
-        self.angles_deg = angles or [0, 45, 90, 135]
+        self.distances = [1, 3, 5] if distances is None else list(distances)
+        self.angles_deg = [0, 45, 90, 135] if angles is None else list(angles)
         self.angles_rad = np.deg2rad(self.angles_deg)
         self.levels = levels
-        self.properties = properties or [
+        default_properties = [
             "contrast", "dissimilarity", "homogeneity",
             "energy", "correlation", "ASM"
         ]
+        self.properties = default_properties if properties is None else list(properties)
 
     def compute(self, img_rgb: np.ndarray,
                 mask: Optional[np.ndarray] = None) -> Dict[str, float]:
@@ -66,6 +63,9 @@ class GLCMTextureExtractor:
         Returns:
             扁平特征字典
         """
+        if not self.properties:
+            return {}
+
         if img_rgb.dtype != np.uint8:
             img_uint8 = (img_rgb * 255).clip(0, 255).astype(np.uint8)
         else:
@@ -113,7 +113,7 @@ class GLCMTextureExtractor:
 
         for prop in self.properties:
             try:
-                prop_array = graycoprop(glcm, prop)
+                prop_array = graycoprops(glcm, prop)
                 # shape: (n_distances, n_angles)
                 feats[f"GLCM_{prop}_mean"] = float(prop_array.mean())
                 feats[f"GLCM_{prop}_std"] = float(prop_array.std())
@@ -145,11 +145,12 @@ class LeafShapeExtractor:
     """
 
     def __init__(self, features: Optional[List[str]] = None):
-        self.features = features or [
+        default_features = [
             "area", "perimeter", "circularity", "eccentricity",
             "solidity", "extent", "aspect_ratio", "roundness",
             "major_axis_length", "minor_axis_length"
         ]
+        self.features = default_features if features is None else list(features)
 
     def compute(self, mask: np.ndarray,
                 pixel_scale: Optional[float] = None) -> Dict[str, float]:
@@ -163,6 +164,9 @@ class LeafShapeExtractor:
         Returns:
             形状特征字典
         """
+        if not self.features:
+            return {}
+
         if mask.max() > 1:
             mask_bin = (mask > 127).astype(np.uint8)
         else:

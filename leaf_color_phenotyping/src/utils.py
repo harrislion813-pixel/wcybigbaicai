@@ -36,7 +36,7 @@ def find_images(
     return sorted(set(img_paths))
 
 
-def parse_sample_id(filename: str, pattern: str = r"(.+?)_\d+") -> Optional[str]:
+def parse_sample_id(filename: str, pattern: Optional[str] = None) -> str:
     """从文件名中提取样本ID.
 
     支持格式:
@@ -46,17 +46,36 @@ def parse_sample_id(filename: str, pattern: str = r"(.+?)_\d+") -> Optional[str]
 
     Args:
         filename: 文件名 (不含路径)
-        pattern: 正则表达式模式
+        pattern: 自定义正则表达式模式；第一个捕获组必须是样本ID
 
     Returns:
-        样本ID 或 None
+        样本ID
     """
     stem = Path(filename).stem
-    match = re.search(pattern, stem)
-    if match:
+    if pattern is not None:
+        match = re.search(pattern, stem)
+        if not match:
+            return stem
+        if not match.groups():
+            raise ValueError("sample ID regex must contain at least one capture group")
         return match.group(1)
-    # 默认: 取第一个下划线前的部分
-    return stem.split("_")[0] if "_" in stem else stem
+
+    # 常见重复命名：sample_rep1、sample-repeat2、sample_r3。
+    replicate_match = re.match(
+        r"^(.+?)[_-](?:rep(?:licate)?|repeat|r)\d+(?:[_-].*)?$",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    if replicate_match:
+        return replicate_match.group(1)
+
+    # 兼容 sample_1、sample_2_date 等纯数字重复后缀。
+    numeric_match = re.match(r"^(.+?)_\d+(?:_.*)?$", stem)
+    if numeric_match:
+        return numeric_match.group(1)
+
+    # 下划线可能是样本ID的一部分，无法确认时保留完整名称，避免样本碰撞。
+    return stem
 
 
 def safe_mkdir(path: Union[str, Path]) -> Path:
@@ -187,13 +206,14 @@ def rgb_to_hsv(img_rgb: np.ndarray) -> np.ndarray:
 
 
 def rgb_to_ycbcr(img_rgb: np.ndarray) -> np.ndarray:
-    """RGB → YCbCr."""
+    """RGB → YCbCr, returning channels in Y, Cb, Cr order."""
     if img_rgb.max() <= 1.0:
         img_rgb = (img_rgb * 255).astype(np.uint8)
     if img_rgb.dtype != np.uint8:
         img_rgb = img_rgb.astype(np.uint8)
     bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+    return ycrcb[..., [0, 2, 1]]
 
 
 def rgb_to_chromaticity_xyy(img_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -277,11 +297,11 @@ def histogram_features(channel: np.ndarray, bins: int = 32) -> Dict[str, float]:
     if ch.size == 0:
         return {f"hist_bin_{i}": np.nan for i in range(bins)}
 
-    lo, hi = float(ch.min()), float(ch.max())
-    if lo == hi:
-        lo, hi = (0.0, 255.0) if 0 <= lo <= 255 else (lo - 0.5, hi + 0.5)
+    if np.any((ch < 0) | (ch > 255)):
+        raise ValueError("histogram_features expects channel values in [0, 255]")
 
-    hist, _ = np.histogram(ch, bins=bins, range=(lo, hi), density=False)
+    # 固定区间保证不同样本的同名 bin 表示相同亮度范围。
+    hist, _ = np.histogram(ch, bins=bins, range=(0, 256), density=False)
     hist = hist.astype(np.float64)
     total = hist.sum()
     if total > 0:

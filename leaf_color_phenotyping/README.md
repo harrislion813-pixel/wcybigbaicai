@@ -28,6 +28,10 @@ pip install numpy opencv-python scikit-image pandas PyYAML
 
 # 完整安装 (含深度学习)
 pip install -r requirements.txt
+
+# 开发与测试
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ### 单张图像快速验证
@@ -84,9 +88,12 @@ print(df.describe())
 | ... | ... | ... | ... | ... | ... | ... | ... |
 
 每个性状的 `_mean`、`_std`、`_cv` 列分别代表：
-- `_mean`: 多重复均值 → 用于GWAS (BLUP模型输入)
-- `_std`: 重复间标准差 → 评估表型稳定性
-- `_cv`: 变异系数 → 筛选稳定表达的性状
+- 原始特征名中的 `_mean` / `_std` 表示**单张叶片 ROI 内像素**的统计量，
+  例如 `CIELAB_L_mean` 和 `CIELAB_L_std`。
+- 多重复汇总后的均值保留原始特征名，例如 `CIELAB_L_mean`。
+- 重复间标准差和变异系数追加 `_rep_std` / `_rep_cv`，例如
+  `CIELAB_L_mean_rep_std` 和 `CIELAB_L_mean_rep_cv`。
+- 当重复均值接近零时，CV 输出为缺失值，避免产生无意义的极大数。
 
 ## 项目结构
 
@@ -124,22 +131,46 @@ leaf_color_phenotyping/
 
 ## 颜色校准流程 (推荐)
 
-为确保不同批次图像颜色可比, 必须进行颜色校准:
+为确保不同批次图像颜色可比，正式实验应进行颜色校准。流水线不会再把
+“启用但没有 CCM”的配置当作成功：应先计算并保存校正矩阵，再在配置中启用。
 
 ```python
 from src.preprocessing import ImagePreprocessor
 
 # 1. 拍摄含ColorChecker色卡的参考图像
-# 2. 提取色卡24个色块的RGB均值 (可手动标注或用自动检测)
-measured_rgb = extract_colorchecker_patches("reference_with_colorchecker.jpg")
+# 2. 用色卡工具或人工标注提取24个色块的RGB均值，保存为 (24,3) 数组
+import numpy as np
+measured_rgb = np.load("data/colorchecker/measured_rgb.npy")
 
 # 3. 计算颜色校正矩阵
 preprocessor = ImagePreprocessor(calibration_method="polynomial", polynomial_degree=2)
-preprocessor.compute_color_correction_matrix(measured_rgb)
+ccm = preprocessor.compute_color_correction_matrix(measured_rgb)
+
+# 保存 CCM，供批处理配置复用
+np.save("models/colorchecker_ccm.npy", ccm)
 
 # 4. 对后续所有图像应用相同的CCM
 corrected = preprocessor.apply_color_correction(some_image)
 ```
+
+批处理配置：
+
+```yaml
+color_calibration:
+  enabled: true
+  method: polynomial
+  polynomial_degree: 2
+  ccm_file: models/colorchecker_ccm.npy
+```
+
+`ccm_file` 相对于配置文件所在目录解析。若不需要跨批次比较，可保持
+`enabled: false`，但输出应明确记录这一实验条件。
+
+## 批处理失败策略
+
+批处理会继续检查剩余图像，同时在输出目录写入 `*_failures.csv`。只要存在
+失败图像，命令行默认返回非零状态，防止不完整表型表被误当作完整结果；只有
+明确接受部分结果时才使用 `--allow-partial`。
 
 ## GWAS分析衔接
 

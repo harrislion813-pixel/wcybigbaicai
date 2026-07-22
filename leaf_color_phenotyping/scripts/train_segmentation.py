@@ -4,8 +4,6 @@ U-Net / DeepLabV3+ 叶片分割模型训练脚本。
 
 支持的数据集格式:
     - 目录结构: images/ + masks/ (同名PNG, mask为二值图)
-    - COCO JSON 标注
-    - LabelMe JSON 标注
 
 训练策略:
     - Encoder: EfficientNet-B3 (推荐, 精度/速度平衡) 或 ResNet-50
@@ -24,7 +22,8 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+import inspect
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -37,6 +36,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
+from src.segmentation import IMAGENET_MEAN, IMAGENET_STD, normalize_imagenet_rgb
 from src.utils import read_image_gray, read_image_rgb
 
 # 需要额外安装:
@@ -55,30 +55,48 @@ class LeafSegmentationDataset(Dataset):
                  images_dir: str,
                  masks_dir: str,
                  image_size: Tuple[int, int] = (512, 512),
-                 augment: bool = False):
+                 augment: bool = False,
+                 pairs: Optional[List[Tuple[Path, Path]]] = None):
         self.images_dir = Path(images_dir)
         self.masks_dir = Path(masks_dir)
         self.image_size = image_size
         self.augment = augment
 
         # 查找匹配的图像-掩膜对
-        self.pairs: List[Tuple[Path, Path]] = []
-        for img_path in sorted(self.images_dir.glob("*")):
-            if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
-                continue
-            mask_path = self.masks_dir / f"{img_path.stem}.png"
-            if not mask_path.exists():
-                mask_path = self.masks_dir / f"{img_path.stem}.jpg"
-            if mask_path.exists():
-                self.pairs.append((img_path, mask_path))
+        self.pairs: List[Tuple[Path, Path]] = list(pairs or [])
+        if pairs is None:
+            for img_path in sorted(self.images_dir.glob("*")):
+                if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".tif", ".tiff"):
+                    continue
+                mask_path = self.masks_dir / f"{img_path.stem}.png"
+                if not mask_path.exists():
+                    mask_path = self.masks_dir / f"{img_path.stem}.jpg"
+                if mask_path.exists():
+                    self.pairs.append((img_path, mask_path))
 
         print(f"Found {len(self.pairs)} image-mask pairs")
 
         if augment:
             try:
                 import albumentations as A
+                crop_parameters = inspect.signature(A.RandomResizedCrop).parameters
+                if "size" in crop_parameters:
+                    random_crop = A.RandomResizedCrop(
+                        size=tuple(image_size), scale=(0.8, 1.0)
+                    )
+                else:
+                    random_crop = A.RandomResizedCrop(
+                        height=image_size[0], width=image_size[1], scale=(0.8, 1.0)
+                    )
+
+                noise_parameters = inspect.signature(A.GaussNoise).parameters
+                if "std_range" in noise_parameters:
+                    gaussian_noise = A.GaussNoise(std_range=(0.012, 0.028), p=0.2)
+                else:
+                    gaussian_noise = A.GaussNoise(var_limit=(10, 50), p=0.2)
+
                 self.transform = A.Compose([
-                    A.RandomResizedCrop(*image_size, scale=(0.8, 1.0)),
+                    random_crop,
                     A.HorizontalFlip(p=0.5),
                     A.VerticalFlip(p=0.3),
                     A.RandomRotate90(p=0.5),
@@ -87,21 +105,24 @@ class LeafSegmentationDataset(Dataset):
                     A.HueSaturationValue(hue_shift_limit=10,
                                          sat_shift_limit=20,
                                          val_shift_limit=10, p=0.3),
-                    A.GaussNoise(var_limit=(10, 50), p=0.2),
+                    gaussian_noise,
                     A.Blur(blur_limit=3, p=0.2),
-                    A.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225]),
+                    A.Normalize(mean=IMAGENET_MEAN.tolist(),
+                                std=IMAGENET_STD.tolist()),
                 ])
             except ImportError:
                 print("WARNING: albumentations not installed, using basic transform")
                 self.transform = None
         else:
-            import albumentations as A
-            self.transform = A.Compose([
-                A.Resize(*image_size),
-                A.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-            ])
+            try:
+                import albumentations as A
+                self.transform = A.Compose([
+                    A.Resize(height=image_size[0], width=image_size[1]),
+                    A.Normalize(mean=IMAGENET_MEAN.tolist(),
+                                std=IMAGENET_STD.tolist()),
+                ])
+            except ImportError:
+                self.transform = None
 
     def __len__(self):
         return len(self.pairs)
@@ -123,10 +144,10 @@ class LeafSegmentationDataset(Dataset):
             mask = transformed["mask"]
         else:
             # 基础处理
-            img = cv2.resize(img, self.image_size)
-            mask = cv2.resize(mask, self.image_size)
-            img = img.astype(np.float32) / 255.0
-            img = (img - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
+            target_size = (self.image_size[1], self.image_size[0])
+            img = cv2.resize(img, target_size)
+            mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
+            img = normalize_imagenet_rgb(img)
             img = img.transpose(2, 0, 1)  # HWC → CHW
 
         # To tensor
@@ -193,25 +214,43 @@ def compute_iou(pred: torch.Tensor, target: torch.Tensor,
 # ============================================================
 def train(args):
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available; use --device cpu")
+
+    torch.manual_seed(42)
+    np.random.seed(42)
 
     # ---- 数据 ----
-    train_dataset = LeafSegmentationDataset(
-        args.images, args.masks, image_size=args.image_size, augment=True
+    source_dataset = LeafSegmentationDataset(
+        args.images, args.masks, image_size=args.image_size, augment=False
     )
+    if len(source_dataset) < 2:
+        raise ValueError("At least two image-mask pairs are required for train/validation split")
+
     # 简单划分: 80/20
-    n_train = int(len(train_dataset) * 0.8)
-    n_val = len(train_dataset) - n_train
-    train_subset, val_subset = torch.utils.data.random_split(
-        train_dataset, [n_train, n_val],
+    n_train = max(1, int(len(source_dataset) * 0.8))
+    n_val = len(source_dataset) - n_train
+    split_train, split_val = torch.utils.data.random_split(
+        range(len(source_dataset)), [n_train, n_val],
         generator=torch.Generator().manual_seed(42)
     )
 
-    train_loader = DataLoader(train_subset, batch_size=args.batch_size,
+    train_dataset = LeafSegmentationDataset(
+        args.images, args.masks, image_size=args.image_size, augment=True,
+        pairs=[source_dataset.pairs[i] for i in split_train.indices],
+    )
+    val_dataset = LeafSegmentationDataset(
+        args.images, args.masks, image_size=args.image_size, augment=False,
+        pairs=[source_dataset.pairs[i] for i in split_val.indices],
+    )
+
+    pin_memory = device.type == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                               shuffle=True, num_workers=args.workers,
-                              pin_memory=True)
-    val_loader = DataLoader(val_subset, batch_size=args.batch_size,
+                              pin_memory=pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
                             shuffle=False, num_workers=args.workers,
-                            pin_memory=True)
+                            pin_memory=pin_memory)
 
     # ---- 模型 ----
     import segmentation_models_pytorch as smp
@@ -228,14 +267,14 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=args.weight_decay)
     scheduler = CosineAnnealingWarmRestarts(
-        optimizer, T_0=args.epochs // 3, T_mult=2, eta_min=args.lr * 0.01
+        optimizer, T_0=max(1, args.epochs // 3), T_mult=2, eta_min=args.lr * 0.01
     )
 
     # ---- 损失 ----
     criterion = BCEDiceLoss(bce_weight=0.5, dice_weight=0.5)
 
     # ---- 训练 ----
-    best_iou = 0.0
+    best_iou = float("-inf")
     history = {"train_loss": [], "val_loss": [], "val_iou": []}
 
     for epoch in range(1, args.epochs + 1):
@@ -261,12 +300,13 @@ def train(args):
         model.eval()
         val_loss = 0.0
         val_iou = 0.0
-        for images, masks in val_loader:
-            images, masks = images.to(device), masks.to(device)
-            preds = model(images)
-            loss = criterion(preds, masks)
-            val_loss += loss.item()
-            val_iou += compute_iou(preds, masks)
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images, masks = images.to(device), masks.to(device)
+                preds = model(images)
+                loss = criterion(preds, masks)
+                val_loss += loss.item()
+                val_iou += compute_iou(preds, masks)
 
         val_loss /= len(val_loader)
         val_iou /= len(val_loader)

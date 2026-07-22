@@ -11,6 +11,18 @@ import numpy as np
 import cv2
 
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def normalize_imagenet_rgb(img_rgb: np.ndarray) -> np.ndarray:
+    """Normalize a float RGB [0,1] image with ImageNet channel statistics."""
+    img = img_rgb.astype(np.float32)
+    if img.max() > 1.0:
+        img = img / 255.0
+    return (img - IMAGENET_MEAN) / IMAGENET_STD
+
+
 class BaseSegmenter:
     """叶片分割器基类."""
 
@@ -221,6 +233,9 @@ class UNetSegmenter(BaseSegmenter):
         new_w = ((w_orig + 31) // 32) * 32
         img_resized = cv2.resize(img, (new_w, new_h))
 
+        # 与训练阶段保持一致的 ImageNet 归一化。
+        img_resized = normalize_imagenet_rgb(img_resized)
+
         # To tensor: (H,W,C) → (1,C,H,W)
         tensor = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).float()
         tensor = tensor.to(self.device)
@@ -355,8 +370,9 @@ def create_segmenter(method: str = "auto", **kwargs) -> BaseSegmenter:
     if method == "auto":
         # 自动选择: 优先 U-Net, 其次 GrabCut-auto, 兜底 ExG
         if "model_path" in kwargs and Path(kwargs["model_path"]).exists():
-            return UNetSegmenter(**kwargs)
-        seg_cls = AutoSegmenter
+            seg_cls = UNetSegmenter
+        else:
+            seg_cls = AutoSegmenter
 
     else:
         seg_cls = method_map.get(method)
