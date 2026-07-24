@@ -11,14 +11,24 @@ import numpy as np
 import cv2
 
 
+RAW_IMAGE_EXTENSIONS: Tuple[str, ...] = (
+    ".raw", ".dng", ".cr2", ".nef", ".arw", ".raf"
+)
+STANDARD_IMAGE_EXTENSIONS: Tuple[str, ...] = (
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"
+)
+DEFAULT_IMAGE_EXTENSIONS: Tuple[str, ...] = (
+    STANDARD_IMAGE_EXTENSIONS + RAW_IMAGE_EXTENSIONS
+)
+
+
 # ============================================================
 # 文件I/O
 # ============================================================
 
 def find_images(
     directory: str,
-    extensions: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".tif", ".tiff",
-                                     ".bmp", ".raw", ".dng", ".cr2", ".nef", ".arw")
+    extensions: Tuple[str, ...] = DEFAULT_IMAGE_EXTENSIONS,
 ) -> List[Path]:
     """递归查找目录下所有图像文件.
 

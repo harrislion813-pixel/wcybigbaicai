@@ -2,7 +2,7 @@
 图像预处理：RAW转换、白平衡、颜色校准（基于ColorChecker色卡）。
 
 核心流程:
-    RAW → 线性RGB → 白平衡 → 颜色校正矩阵(CCM) → 目标色彩空间
+    RAW/JPEG → 标准sRGB → 白平衡 → 颜色校正矩阵(CCM) → 目标色彩空间
 """
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
@@ -13,7 +13,7 @@ import cv2
 
 from .utils import (
     COLORCHECKER_24_LAB_D50, rgb_to_lab, delta_e_76, safe_mkdir,
-    read_image_rgb,
+    RAW_IMAGE_EXTENSIONS, read_image_rgb,
 )
 
 
@@ -95,14 +95,16 @@ class ImagePreprocessor:
     # ----------------------------------------------------------
     @staticmethod
     def read_raw(raw_path: str,
-                 use_camera_wb: bool = False,
-                 output_bps: int = 16) -> np.ndarray:
-        """读取RAW文件并转换为线性RGB numpy数组.
+                 use_camera_wb: bool = True,
+                 output_bps: int = 16,
+                 linear_output: bool = False) -> np.ndarray:
+        """读取RAW文件并转换为标准sRGB numpy数组.
 
         Args:
-            raw_path: RAW文件路径 (.cr2, .nef, .arw, .dng, .raw)
+            raw_path: RAW文件路径 (.cr2, .nef, .arw, .raf, .dng, .raw)
             use_camera_wb: 是否使用相机白平衡系数
             output_bps: 输出位深度 (8 / 16)
+            linear_output: 是否返回线性sRGB；默认False以匹配JPEG和下游颜色转换
 
         Returns:
             float32 RGB图像, shape (H, W, 3), range [0, 1]
@@ -115,13 +117,11 @@ class ImagePreprocessor:
             )
 
         with rawpy.imread(str(raw_path)) as raw:
-            # 后处理参数
-            # output_color=rawpy.ColorSpace.sRGB → 使用相机内建色彩矩阵
-            # 若需纯线性数据, 用 output_color=rawpy.ColorSpace.raw
+            gamma = (1, 1) if linear_output else (2.222, 4.5)
             rgb = raw.postprocess(
                 use_camera_wb=use_camera_wb,
                 output_color=rawpy.ColorSpace.sRGB,
-                gamma=(1, 1),           # 线性输出 (不做gamma)
+                gamma=gamma,
                 no_auto_bright=True,
                 output_bps=16 if output_bps == 16 else 8,
             )
@@ -295,7 +295,7 @@ class ImagePreprocessor:
         """
         # Step 1: 读取
         ext = Path(image_path).suffix.lower()
-        if ext in (".raw", ".dng", ".cr2", ".nef", ".arw"):
+        if ext in RAW_IMAGE_EXTENSIONS:
             img = self.read_raw(image_path)
         else:
             img = self.read_image(image_path)

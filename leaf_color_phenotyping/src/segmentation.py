@@ -26,30 +26,49 @@ def normalize_imagenet_rgb(img_rgb: np.ndarray) -> np.ndarray:
 class BaseSegmenter:
     """叶片分割器基类."""
 
-    def __init__(self, morph_kernel_size: int = 5, min_area_ratio: float = 0.01):
+    def __init__(self, morph_kernel_size: int = 5, min_area_ratio: float = 0.002,
+                 exclude_border_components: bool = False,
+                 border_margin_ratio: float = 0.01):
         self.morph_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size))
         self.min_area_ratio = min_area_ratio
+        self.exclude_border_components = exclude_border_components
+        self.border_margin_ratio = border_margin_ratio
 
     def segment(self, img_rgb: np.ndarray, **kwargs) -> np.ndarray:
         raise NotImplementedError
 
     def postprocess(self, mask: np.ndarray) -> np.ndarray:
         """后处理: 形态学去噪 + 去除小连通域."""
+        mask = (mask > 0).astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.morph_kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.morph_kernel)
 
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        if num_labels <= 1:
-            return mask
-
-        total_area = mask.shape[0] * mask.shape[1]
+        height, width = mask.shape[:2]
+        total_area = height * width
         min_area = total_area * self.min_area_ratio
+        margin_x = int(round(width * self.border_margin_ratio))
+        margin_y = int(round(height * self.border_margin_ratio))
 
         cleaned = np.zeros_like(mask)
-        for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] >= min_area:
-                cleaned[labels == i] = 255
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+
+            if self.exclude_border_components:
+                x, y, w, h = cv2.boundingRect(contour)
+                touches_border_margin = (
+                    x <= margin_x or y <= margin_y or
+                    x + w >= width - margin_x or
+                    y + h >= height - margin_y
+                )
+                if touches_border_margin:
+                    continue
+
+            cv2.drawContours(cleaned, [contour], -1, 255, thickness=cv2.FILLED)
         return cleaned
 
 
@@ -62,8 +81,11 @@ class ExGSegmenter(BaseSegmenter):
     """
 
     def __init__(self, exg_threshold: float = 0.15, use_otsu: bool = True,
-                 morph_kernel_size: int = 5, min_area_ratio: float = 0.01):
-        super().__init__(morph_kernel_size, min_area_ratio)
+                 morph_kernel_size: int = 5, min_area_ratio: float = 0.002,
+                 exclude_border_components: bool = False,
+                 border_margin_ratio: float = 0.01):
+        super().__init__(morph_kernel_size, min_area_ratio,
+                         exclude_border_components, border_margin_ratio)
         self.exg_threshold = exg_threshold
         self.use_otsu = use_otsu
 
@@ -108,8 +130,11 @@ class GrabCutSegmenter(BaseSegmenter):
     """
 
     def __init__(self, iterations: int = 5, morph_kernel_size: int = 5,
-                 min_area_ratio: float = 0.01):
-        super().__init__(morph_kernel_size, min_area_ratio)
+                 min_area_ratio: float = 0.002,
+                 exclude_border_components: bool = False,
+                 border_margin_ratio: float = 0.01):
+        super().__init__(morph_kernel_size, min_area_ratio,
+                         exclude_border_components, border_margin_ratio)
         self.iterations = iterations
 
     def segment(self, img_rgb: np.ndarray,
@@ -158,18 +183,34 @@ class GrabCutSegmenter(BaseSegmenter):
 
     def segment_auto(self, img_rgb: np.ndarray) -> np.ndarray:
         """自动模式: 先ExG粗分割, 再用GrabCut精修."""
-        exg_seg = ExGSegmenter(morph_kernel_size=3, min_area_ratio=0.005)
-        init_mask = exg_seg.segment(img_rgb)
-        if not np.any(init_mask > 0):
-            return init_mask
+        exg_seg = ExGSegmenter(
+            morph_kernel_size=self.morph_kernel.shape[0],
+            min_area_ratio=self.min_area_ratio,
+            exclude_border_components=self.exclude_border_components,
+            border_margin_ratio=self.border_margin_ratio,
+        )
+        proposal = exg_seg.segment(img_rgb)
+        if not np.any(proposal > 0):
+            return proposal
         # 膨胀初始掩膜
-        init_mask = cv2.dilate(init_mask, np.ones((7, 7), np.uint8), iterations=2)
+        init_mask = cv2.dilate(proposal, np.ones((7, 7), np.uint8), iterations=2)
         # GrabCut精修
         try:
             refined = self.segment(img_rgb, init_mask=init_mask)
         except cv2.error:
-            return exg_seg.segment(img_rgb)
-        return refined if np.any(refined > 0) else exg_seg.segment(img_rgb)
+            return proposal
+        if not np.any(refined > 0):
+            return proposal
+
+        proposal_contours, _ = cv2.findContours(
+            proposal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        refined_contours, _ = cv2.findContours(
+            refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if len(refined_contours) < len(proposal_contours):
+            return proposal
+        return refined
 
 
 class UNetSegmenter(BaseSegmenter):
@@ -180,8 +221,11 @@ class UNetSegmenter(BaseSegmenter):
 
     def __init__(self, model_path: str, backbone: str = "efficientnet-b3",
                  device: str = "cuda", morph_kernel_size: int = 5,
-                 min_area_ratio: float = 0.005):
-        super().__init__(morph_kernel_size, min_area_ratio)
+                 min_area_ratio: float = 0.005,
+                 exclude_border_components: bool = False,
+                 border_margin_ratio: float = 0.01):
+        super().__init__(morph_kernel_size, min_area_ratio,
+                         exclude_border_components, border_margin_ratio)
         self.model_path = model_path
         self.backbone = backbone
         self.device = device
@@ -260,8 +304,11 @@ class SAMSegmenter(BaseSegmenter):
 
     def __init__(self, sam_checkpoint: str, model_type: str = "vit_h",
                  device: str = "cuda", morph_kernel_size: int = 5,
-                 min_area_ratio: float = 0.005):
-        super().__init__(morph_kernel_size, min_area_ratio)
+                 min_area_ratio: float = 0.005,
+                 exclude_border_components: bool = False,
+                 border_margin_ratio: float = 0.01):
+        super().__init__(morph_kernel_size, min_area_ratio,
+                         exclude_border_components, border_margin_ratio)
         self.sam_checkpoint = sam_checkpoint
         self.model_type = model_type
         self.device = device
@@ -329,16 +376,23 @@ class AutoSegmenter(BaseSegmenter):
     """Lightweight automatic segmenter: ExG proposal followed by GrabCut refinement."""
 
     def __init__(self, iterations: int = 5, morph_kernel_size: int = 5,
-                 min_area_ratio: float = 0.01):
-        super().__init__(morph_kernel_size, min_area_ratio)
+                 min_area_ratio: float = 0.002,
+                 exclude_border_components: bool = False,
+                 border_margin_ratio: float = 0.01):
+        super().__init__(morph_kernel_size, min_area_ratio,
+                         exclude_border_components, border_margin_ratio)
         self.grabcut = GrabCutSegmenter(
             iterations=iterations,
             morph_kernel_size=morph_kernel_size,
             min_area_ratio=min_area_ratio,
+            exclude_border_components=exclude_border_components,
+            border_margin_ratio=border_margin_ratio,
         )
         self.exg = ExGSegmenter(
             morph_kernel_size=morph_kernel_size,
             min_area_ratio=min_area_ratio,
+            exclude_border_components=exclude_border_components,
+            border_margin_ratio=border_margin_ratio,
         )
 
     def segment(self, img_rgb: np.ndarray, **kwargs) -> np.ndarray:

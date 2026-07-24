@@ -89,7 +89,7 @@ leaf_color_phenotyping/
         └── BJC-002_rep2.jpg
 ~~~
 
-支持的常见图片包括 JPG、JPEG、PNG、TIF、TIFF 和 BMP。安装 rawpy 后，还可读取常见 RAW 格式。
+支持的常见图片包括 JPG、JPEG、PNG、TIF、TIFF 和 BMP。安装 rawpy 后，还可读取 RAF、DNG、CR2、NEF、ARW 等常见 RAW 格式。RAW 默认转换为带相机白平衡的标准 sRGB，并关闭逐图自动增亮，以便与下游颜色空间转换保持一致。
 
 建议：
 
@@ -340,6 +340,9 @@ color_calibration:
 segmentation:
   method: "exg"
   device: "cpu"
+  min_leaf_area_ratio: 0.002
+  exclude_border_components: true
+  border_margin_ratio: 0.01
 
 output:
   format: "csv"

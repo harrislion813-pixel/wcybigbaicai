@@ -1,14 +1,17 @@
 import json
 import sys
+import types
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import src.segmentation as segmentation_module
 from scripts import batch_extract
 from src.pipeline import LeafColorPipeline
 from src.preprocessing import ImagePreprocessor
-from src.utils import parse_sample_id, write_image_rgb
+from src.segmentation import BaseSegmenter, GrabCutSegmenter
+from src.utils import find_images, parse_sample_id, write_image_rgb
 
 
 def test_disabled_feature_groups_stay_disabled():
@@ -63,6 +66,136 @@ def test_invalid_ccm_shape_is_rejected():
 
     with pytest.raises(ValueError, match="CCM shape"):
         preprocessor.set_color_correction_matrix(np.eye(2))
+
+
+def test_find_images_includes_uppercase_raf(tmp_path):
+    raf_path = tmp_path / "leaf.RAF"
+    raf_path.write_bytes(b"test")
+
+    assert find_images(str(tmp_path)) == [raf_path]
+
+
+def test_raf_is_routed_through_raw_reader(tmp_path, monkeypatch):
+    raf_path = tmp_path / "leaf.RAF"
+    raf_path.write_bytes(b"test")
+    expected = np.full((2, 3, 3), 0.5, dtype=np.float32)
+    calls = []
+
+    def fake_read_raw(path):
+        calls.append(path)
+        return expected.copy()
+
+    preprocessor = ImagePreprocessor()
+    monkeypatch.setattr(preprocessor, "read_raw", fake_read_raw)
+
+    result = preprocessor.process(str(raf_path), white_balance_method="none")
+
+    assert calls == [str(raf_path)]
+    assert np.array_equal(result["rgb"], expected)
+
+
+def test_raw_reader_uses_camera_wb_and_srgb_gamma_by_default(monkeypatch):
+    captured = {}
+
+    class FakeRaw:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def postprocess(self, **kwargs):
+            captured.update(kwargs)
+            return np.full((2, 3, 3), 32768, dtype=np.uint16)
+
+    fake_rawpy = types.SimpleNamespace(
+        imread=lambda path: FakeRaw(),
+        ColorSpace=types.SimpleNamespace(sRGB="sRGB"),
+    )
+    monkeypatch.setitem(sys.modules, "rawpy", fake_rawpy)
+
+    result = ImagePreprocessor.read_raw("leaf.RAF")
+
+    assert captured["use_camera_wb"] is True
+    assert captured["output_color"] == "sRGB"
+    assert captured["gamma"] == (2.222, 4.5)
+    assert captured["no_auto_bright"] is True
+    assert captured["output_bps"] == 16
+    assert np.allclose(result, 32768 / 65535)
+
+
+def test_postprocess_removes_border_object_and_keeps_small_center_leaves():
+    mask = np.zeros((200, 200), dtype=np.uint8)
+    mask[0:180, 0:20] = 255
+    mask[50:80, 70:100] = 255
+    mask[110:135, 120:150] = 255
+
+    segmenter = BaseSegmenter(
+        morph_kernel_size=1,
+        min_area_ratio=0.002,
+        exclude_border_components=True,
+        border_margin_ratio=0.01,
+    )
+    result = segmenter.postprocess(mask)
+
+    assert not np.any(result[0:180, 0:20])
+    assert np.all(result[50:80, 70:100] == 255)
+    assert np.all(result[110:135, 120:150] == 255)
+
+
+def test_grabcut_auto_seed_inherits_configured_area_and_border_filters(monkeypatch):
+    captured = {}
+
+    class FakeExGSegmenter:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def segment(self, image):
+            mask = np.zeros(image.shape[:2], dtype=np.uint8)
+            mask[3:7, 3:7] = 255
+            return mask
+
+    segmenter = GrabCutSegmenter(
+        min_area_ratio=0.002,
+        exclude_border_components=True,
+        border_margin_ratio=0.03,
+    )
+    monkeypatch.setattr(segmentation_module, "ExGSegmenter", FakeExGSegmenter)
+    monkeypatch.setattr(
+        segmenter, "segment", lambda image, init_mask=None, **kwargs: init_mask
+    )
+
+    result = segmenter.segment_auto(np.zeros((10, 10, 3), dtype=np.float32))
+
+    assert captured["min_area_ratio"] == 0.002
+    assert captured["exclude_border_components"] is True
+    assert captured["border_margin_ratio"] == 0.03
+    assert np.any(result)
+
+
+def test_grabcut_auto_keeps_proposal_when_refinement_loses_a_leaf(monkeypatch):
+    proposal = np.zeros((30, 30), dtype=np.uint8)
+    proposal[5:10, 5:10] = 255
+    proposal[20:25, 20:25] = 255
+
+    class FakeExGSegmenter:
+        def __init__(self, **kwargs):
+            pass
+
+        def segment(self, image):
+            return proposal.copy()
+
+    refined = np.zeros_like(proposal)
+    refined[20:25, 20:25] = 255
+    segmenter = GrabCutSegmenter(min_area_ratio=0.002)
+    monkeypatch.setattr(segmentation_module, "ExGSegmenter", FakeExGSegmenter)
+    monkeypatch.setattr(
+        segmenter, "segment", lambda image, init_mask=None, **kwargs: refined.copy()
+    )
+
+    result = segmenter.segment_auto(np.zeros((30, 30, 3), dtype=np.float32))
+
+    assert np.array_equal(result, proposal)
 
 
 def test_cli_override_defaults_are_none(monkeypatch):

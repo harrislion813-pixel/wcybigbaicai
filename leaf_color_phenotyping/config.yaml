@@ -34,7 +34,9 @@ segmentation:
   grabcut_iterations: 5         # GrabCut迭代次数 (method=grabcut)
   # 形态学后处理
   morph_kernel_size: 5          # 开/闭运算核大小
-  min_leaf_area_ratio: 0.05     # 最小叶片面积占比（小于此值的连通域去除）
+  min_leaf_area_ratio: 0.002    # 最小叶片面积占比；远景小叶片建议从0.2%开始
+  exclude_border_components: true  # 去除接触画面边缘的标尺、背景等大连通域
+  border_margin_ratio: 0.01     # 边缘排除带宽，占图像宽高的比例
 
 # ---------- 颜色特征提取 ----------
 features:
