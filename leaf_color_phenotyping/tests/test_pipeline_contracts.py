@@ -383,6 +383,63 @@ def test_largest_component_policy_is_reflected_in_qc():
     assert np.isclose(qc["QC_largest_component_fraction"], 0.8)
 
 
+def test_white_tissue_filter_removes_low_saturation_pixels_inside_leaf():
+    mask = np.full((10, 10), 255, dtype=np.uint8)
+    image = np.full((10, 10, 3), [0.1, 0.7, 0.1], dtype=np.float32)
+    image[2:4, 2:7] = [0.8, 0.8, 0.8]
+
+    refined, qc = LeafColorPipeline._exclude_white_tissue(
+        mask,
+        image,
+        max_saturation=0.25,
+        min_retained_fraction=0.50,
+    )
+
+    assert np.count_nonzero(refined) == 90
+    assert np.all(refined[2:4, 2:7] == 0)
+    assert np.all(refined[0:2] == 255)
+    assert qc["QC_white_tissue_removed_px"] == 10
+    assert np.isclose(qc["QC_white_tissue_removed_fraction"], 0.10)
+    assert qc["QC_white_tissue_filter_rollback"] == 0
+
+    mask_qc = LeafColorPipeline._mask_qc(
+        refined,
+        raw_mask=mask,
+        selected_component_mask=mask,
+    )
+    assert np.isclose(mask_qc["QC_mask_area_ratio"], 0.90)
+    assert np.isclose(mask_qc["QC_selected_component_fraction"], 1.0)
+
+
+def test_white_tissue_filter_rolls_back_when_too_little_leaf_would_remain():
+    mask = np.full((10, 10), 255, dtype=np.uint8)
+    image = np.full((10, 10, 3), 0.8, dtype=np.float32)
+    image[0, 0] = [0.1, 0.7, 0.1]
+
+    refined, qc = LeafColorPipeline._exclude_white_tissue(
+        mask,
+        image,
+        max_saturation=0.25,
+        min_retained_fraction=0.50,
+    )
+
+    assert np.array_equal(refined, mask)
+    assert qc["QC_white_tissue_removed_px"] == 0
+    assert qc["QC_white_tissue_removed_fraction"] == 0
+    assert qc["QC_white_tissue_filter_rollback"] == 1
+
+
+def test_white_tissue_filter_config_is_validated():
+    with pytest.raises(ValueError, match="white_tissue_max_saturation"):
+        LeafColorPipeline({
+            "segmentation": {"white_tissue_max_saturation": 1.01}
+        })
+    with pytest.raises(ValueError, match="white_tissue_min_retained_fraction"):
+        LeafColorPipeline({
+            "segmentation": {"white_tissue_min_retained_fraction": 0}
+        })
+
+
 def test_single_replicates_do_not_create_all_nan_stat_columns():
     frame = pd.DataFrame({
         "sample_id": ["A", "B"],

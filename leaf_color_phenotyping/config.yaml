@@ -33,6 +33,9 @@ segmentation:
   component_min_exg: 0.30       # 植被候选连通域的最小归一化 ExG
   max_processing_dimension: 2200  # 分割缩略图最长边；颜色仍按原图统计
   normalize_illumination: true   # 仅为分割做灰度世界归一化，不改变量化色值
+  exclude_white_tissue: true     # 去除叶片内部低饱和度的白色叶柄、主脉
+  white_tissue_max_saturation: 0.25  # HSV 饱和度不高于此值时视为白色候选
+  white_tissue_min_retained_fraction: 0.50  # 至少保留一半叶片，否则回退原掩膜
   unet_model: "models/unet_efficientnet_b3.pth"
   device: "cpu"                 # cuda | cpu
   # 传统方法参数

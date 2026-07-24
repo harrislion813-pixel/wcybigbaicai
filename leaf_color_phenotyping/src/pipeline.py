@@ -84,6 +84,15 @@ class LeafColorPipeline:
         self.normalize_segmentation_illumination = segmentation.get(
             "normalize_illumination", True
         )
+        self.exclude_white_tissue = segmentation.get(
+            "exclude_white_tissue", True
+        )
+        self.white_tissue_max_saturation = float(
+            segmentation.get("white_tissue_max_saturation", 0.25)
+        )
+        self.white_tissue_min_retained_fraction = float(
+            segmentation.get("white_tissue_min_retained_fraction", 0.50)
+        )
 
         # ---- 初始化各模块 ----
         self.preprocessor = self._init_preprocessor()
@@ -138,6 +147,30 @@ class LeafColorPipeline:
             )
         if not isinstance(segmentation.get("normalize_illumination", True), bool):
             raise TypeError("segmentation.normalize_illumination must be boolean")
+        if not isinstance(segmentation.get("exclude_white_tissue", True), bool):
+            raise TypeError("segmentation.exclude_white_tissue must be boolean")
+        white_max_saturation = segmentation.get(
+            "white_tissue_max_saturation", 0.25
+        )
+        if (
+            isinstance(white_max_saturation, bool)
+            or not isinstance(white_max_saturation, (int, float))
+            or not 0 <= white_max_saturation <= 1
+        ):
+            raise ValueError(
+                "segmentation.white_tissue_max_saturation must be in [0, 1]"
+            )
+        min_retained_fraction = segmentation.get(
+            "white_tissue_min_retained_fraction", 0.50
+        )
+        if (
+            isinstance(min_retained_fraction, bool)
+            or not isinstance(min_retained_fraction, (int, float))
+            or not 0 < min_retained_fraction <= 1
+        ):
+            raise ValueError(
+                "segmentation.white_tissue_min_retained_fraction must be in (0, 1]"
+            )
 
         features = config.get("features", {})
         if not isinstance(features, dict):
@@ -193,6 +226,8 @@ class LeafColorPipeline:
             if key in {
                 "method", "component_policy", "max_processing_dimension",
                 "normalize_illumination", "component_min_exg",
+                "exclude_white_tissue", "white_tissue_max_saturation",
+                "white_tissue_min_retained_fraction",
             }:
                 continue
             kwargs[_SEGMENTATION_ALIASES.get(key, key)] = value
@@ -311,13 +346,32 @@ class LeafColorPipeline:
         if self.normalize_segmentation_illumination:
             segmentation_rgb = self.preprocessor.white_balance_gray_world(img_rgb)
         raw_mask = self._segment_image(segmentation_rgb)
-        mask = self._select_analysis_mask(
+        component_mask = self._select_analysis_mask(
             raw_mask,
             self.component_policy,
             img_rgb=segmentation_rgb,
             min_exg=self.component_min_exg,
         )
-        mask_qc = self._mask_qc(mask, raw_mask=raw_mask)
+        if self.exclude_white_tissue:
+            mask, white_tissue_qc = self._exclude_white_tissue(
+                component_mask,
+                img_rgb,
+                max_saturation=self.white_tissue_max_saturation,
+                min_retained_fraction=self.white_tissue_min_retained_fraction,
+            )
+        else:
+            mask = component_mask
+            white_tissue_qc = {
+                "QC_white_tissue_removed_px": 0.0,
+                "QC_white_tissue_removed_fraction": 0.0,
+                "QC_white_tissue_filter_rollback": 0.0,
+            }
+        mask_qc = self._mask_qc(
+            mask,
+            raw_mask=raw_mask,
+            selected_component_mask=component_mask,
+        )
+        mask_qc.update(white_tissue_qc)
 
         # Feature extraction works on the leaf bounding box at original pixel
         # resolution. This preserves color values while avoiding repeated
@@ -350,8 +404,11 @@ class LeafColorPipeline:
         )
 
         # ---- Step 6: 形状特征 ----
+        # Connected-component selection has already happened. If white tissue
+        # splits the remaining green tissue into several pieces, keep all of
+        # those pieces consistent with the mask used by the other extractors.
         shape_feats = self.shape_extractor.compute(
-            mask, component_policy=self.component_policy
+            mask, component_policy="all"
         )
 
         # ---- Step 7: 颜色均匀性 ----
@@ -387,7 +444,10 @@ class LeafColorPipeline:
         if return_visualization:
             result["mask"] = mask
             result["visualization"] = self._create_visualization(
-                img_uint8, mask, all_features
+                img_uint8,
+                mask,
+                all_features,
+                excluded_white_mask=(component_mask > 0) & (mask == 0),
             )
 
         elapsed = time.time() - t_start
@@ -613,6 +673,72 @@ class LeafColorPipeline:
         return (labels == selected_label).astype(np.uint8) * 255
 
     @staticmethod
+    def _exclude_white_tissue(
+        mask: np.ndarray,
+        img_rgb: np.ndarray,
+        max_saturation: float = 0.25,
+        min_retained_fraction: float = 0.50,
+    ) -> tuple[np.ndarray, Dict[str, float]]:
+        """Remove low-saturation white/gray tissue from inside a leaf mask.
+
+        Saturation is exposure-tolerant, so the same threshold can identify a
+        pale midrib in both bright and dark photographs. Processing is limited
+        to the leaf bounding box to avoid allocating full-frame color helpers.
+        If filtering would remove too much of the selected leaf, the original
+        mask is returned and the rollback is exposed through QC.
+        """
+        if mask.shape != img_rgb.shape[:2]:
+            raise ValueError("mask and img_rgb must have matching height and width")
+        if not 0 <= max_saturation <= 1:
+            raise ValueError("max_saturation must be in [0, 1]")
+        if not 0 < min_retained_fraction <= 1:
+            raise ValueError("min_retained_fraction must be in (0, 1]")
+
+        mask_bin = mask > (127 if mask.max() > 1 else 0)
+        original_area = int(mask_bin.sum())
+        empty_qc = {
+            "QC_white_tissue_removed_px": 0.0,
+            "QC_white_tissue_removed_fraction": 0.0,
+            "QC_white_tissue_filter_rollback": 0.0,
+        }
+        if original_area == 0:
+            return mask_bin.astype(np.uint8) * 255, empty_qc
+
+        x, y, width, height = cv2.boundingRect(mask_bin.astype(np.uint8))
+        mask_crop = mask_bin[y:y + height, x:x + width]
+        rgb_crop = np.clip(
+            img_rgb[y:y + height, x:x + width].astype(np.float32), 0.0, 1.0
+        )
+        channel_max = rgb_crop.max(axis=2)
+        channel_min = rgb_crop.min(axis=2)
+        saturation = np.divide(
+            channel_max - channel_min,
+            channel_max,
+            out=np.zeros_like(channel_max),
+            where=channel_max > 1e-8,
+        )
+        excluded_crop = mask_crop & (saturation <= max_saturation)
+        removed_area = int(excluded_crop.sum())
+        if removed_area == 0:
+            return mask_bin.astype(np.uint8) * 255, empty_qc
+
+        retained_fraction = (original_area - removed_area) / original_area
+        if retained_fraction < min_retained_fraction:
+            rollback_qc = dict(empty_qc)
+            rollback_qc["QC_white_tissue_filter_rollback"] = 1.0
+            return mask_bin.astype(np.uint8) * 255, rollback_qc
+
+        refined = mask_bin.copy()
+        refined_crop = refined[y:y + height, x:x + width]
+        refined_crop[excluded_crop] = False
+        qc = {
+            "QC_white_tissue_removed_px": float(removed_area),
+            "QC_white_tissue_removed_fraction": float(removed_area / original_area),
+            "QC_white_tissue_filter_rollback": 0.0,
+        }
+        return refined.astype(np.uint8) * 255, qc
+
+    @staticmethod
     def _crop_to_mask(mask: np.ndarray, **arrays: np.ndarray) -> Dict[str, np.ndarray]:
         """Crop aligned image arrays to the selected mask bounding box."""
         mask_bin = mask > (127 if mask.max() > 1 else 0)
@@ -630,7 +756,9 @@ class LeafColorPipeline:
 
     @staticmethod
     def _mask_qc(
-        mask: np.ndarray, raw_mask: Optional[np.ndarray] = None
+        mask: np.ndarray,
+        raw_mask: Optional[np.ndarray] = None,
+        selected_component_mask: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         """Summarize segmentation mask quality for downstream filtering."""
         if mask.max() > 1:
@@ -648,6 +776,13 @@ class LeafColorPipeline:
         component_areas = component_stats[1:, cv2.CC_STAT_AREA]
         raw_area_px = int(raw_bin.sum())
         largest_component_area = int(component_areas.max()) if component_areas.size else 0
+        selected_component_mask = (
+            mask if selected_component_mask is None else selected_component_mask
+        )
+        selected_component_bin = selected_component_mask > (
+            127 if selected_component_mask.max() > 1 else 0
+        )
+        selected_component_area_px = int(selected_component_bin.sum())
 
         border_pixels = np.zeros_like(mask_bin, dtype=bool)
         border_pixels[0, :] = True
@@ -669,7 +804,8 @@ class LeafColorPipeline:
                 float(largest_component_area / raw_area_px) if raw_area_px else np.nan
             ),
             "QC_selected_component_fraction": (
-                float(area_px / raw_area_px) if raw_area_px else np.nan
+                float(selected_component_area_px / raw_area_px)
+                if raw_area_px else np.nan
             ),
             "QC_border_contact_ratio": (
                 float(border_contact_px / area_px) if area_px else np.nan
@@ -867,7 +1003,8 @@ class LeafColorPipeline:
     @staticmethod
     def _create_visualization(img_uint8: np.ndarray,
                               mask: np.ndarray,
-                              features: Dict[str, float]
+                              features: Dict[str, float],
+                              excluded_white_mask: Optional[np.ndarray] = None,
                               ) -> np.ndarray:
         """生成叶色分析可视化图像.
 
@@ -889,6 +1026,20 @@ class LeafColorPipeline:
         )
         cv2.drawContours(vis, contours, -1, (0, 255, 0), max(2, w // 400))
 
+        # Mark excluded low-saturation petiole/midrib pixels in red so users
+        # can verify the tissue filter without inspecting the numeric mask.
+        if excluded_white_mask is not None and np.any(excluded_white_mask):
+            excluded = excluded_white_mask.astype(bool)
+            red_overlay = vis.copy()
+            red_overlay[excluded] = (255, 0, 0)
+            vis = cv2.addWeighted(vis, 0.35, red_overlay, 0.65, 0)
+            excluded_contours, _ = cv2.findContours(
+                excluded.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(
+                vis, excluded_contours, -1, (255, 0, 0), max(1, w // 600)
+            )
+
         # 信息叠加
         font = cv2.FONT_HERSHEY_SIMPLEX
         scale = max(0.35, w / 1200)
@@ -903,6 +1054,11 @@ class LeafColorPipeline:
             ("GLI", features.get("GLI", 0), "{:.3f}"),
             ("DGCI", features.get("DGCI", 0), "{:.3f}"),
             ("Area", features.get("Shape_area", 0), "{:.0f}"),
+            (
+                "White rm%",
+                100 * features.get("QC_white_tissue_removed_fraction", 0),
+                "{:.1f}",
+            ),
         ]
         for label, val, fmt in key_items:
             if np.isnan(val):

@@ -198,6 +198,9 @@ segmentation:
   component_min_exg: 0.30
   max_processing_dimension: 2200
   normalize_illumination: true
+  exclude_white_tissue: true
+  white_tissue_max_saturation: 0.25
+  white_tissue_min_retained_fraction: 0.50
   device: "cpu"
   grabcut_iterations: 5
   morph_kernel_size: 5
@@ -216,7 +219,7 @@ output:
 
 这组参数适用于当前测试图：标尺靠近画面边缘，叶片位于画面内部，而且叶片面积相对整图较小。
 
-这几项可以这样理解：用于计算颜色的图像不再逐张自动重做白平衡；程序会在一个缩小的临时副本上寻找叶片，以提高速度；找到的掩膜会映射回原图，因此最终颜色仍来自原始分辨率像素；一张图有多个候选区域时默认只统计主要叶片。
+这几项可以这样理解：用于计算颜色的图像不再逐张自动重做白平衡；程序会在一个缩小的临时副本上寻找叶片，以提高速度；找到的掩膜会映射回原图，因此最终颜色仍来自原始分辨率像素；一张图有多个候选区域时默认只统计主要叶片；主要叶片中的白色叶柄和主脉会按低饱和度筛除，不进入后续特征计算。
 
 ### 步骤 4：先做小批量检查
 
@@ -246,6 +249,9 @@ python scripts\batch_extract.py --no-aggregate --visualize --verbose
 - `QC_raw_mask_area_px`：连通域选择前的候选掩膜像素数；
 - `QC_component_count`：候选连通域数量；
 - `QC_selected_component_fraction`：选中叶片占候选掩膜的比例；
+- `QC_white_tissue_removed_px`：从主要叶片中剔除的白色组织像素数；
+- `QC_white_tissue_removed_fraction`：白色组织占筛选前主要叶片的比例；
+- `QC_white_tissue_filter_rollback`：`1` 表示筛选预计会误删过多叶片，程序已自动回退到原掩膜；
 - `QC_largest_component_fraction`：最大候选域占比；
 - `QC_border_contact_ratio`：选中掩膜接触图像边界的像素比例；
 - `QC_mask_area_ratio`：最终掩膜占整张图的比例；
@@ -262,6 +268,8 @@ python scripts\batch_extract.py --no-aggregate --visualize --verbose
 |---|---|
 | 标尺贴近图像边缘并被识别 | 保持 `exclude_border_components: true`；增大 `border_margin_ratio`，如 `0.02` |
 | 标尺没有接触边缘 | 仅靠边缘过滤无法删除；重新构图、裁图，或使用训练好的 U-Net |
+| 白色叶柄或主脉仍进入统计 | 适当增大 `white_tissue_max_saturation`，例如从 `0.25` 调到 `0.30`；每次调整都要检查红色剔除标记 |
+| 叶片浅绿色区域被误删 | 减小 `white_tissue_max_saturation`，例如从 `0.25` 调到 `0.20`；也可临时设置 `exclude_white_tissue: false` |
 | 小叶片被删除 | 减小 `min_leaf_area_ratio`，如从 `0.002` 改为 `0.001` |
 | 小噪点过多 | 增大 `min_leaf_area_ratio` 或 `morph_kernel_size` |
 | 叶片边缘损失 | 减小 `morph_kernel_size`；优先尝试 `auto` |
@@ -416,6 +424,9 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 | `component_min_exg` | `0.30` | `largest` 模式筛选植被候选域的最小归一化 ExG |
 | `max_processing_dimension` | `2200` | 分割代理图最长边；掩膜映射回原图，颜色仍按原始像素计算 |
 | `normalize_illumination` | `true` | 是否仅为分割做灰度世界光照归一化 |
+| `exclude_white_tissue` | `true` | 是否在主要叶片内部剔除低饱和度的白色叶柄和主脉 |
+| `white_tissue_max_saturation` | `0.25` | HSV 饱和度不高于此值的掩膜像素视为白色候选；增大时剔除更积极 |
+| `white_tissue_min_retained_fraction` | `0.50` | 筛选后至少保留的叶片比例；低于此值时自动回退，避免浅色叶片被误删 |
 | `unet_model` | `models/unet_efficientnet_b3.pth` | U-Net 权重路径；内部映射为 `model_path` |
 | `backbone` | 未写，代码默认 `efficientnet-b3` | U-Net 编码器，必须与训练时一致 |
 | `device` | `cpu` | `cpu` 或 `cuda` |
@@ -431,6 +442,8 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 `auto` 有一个重要行为：如果 `unet_model` 指向的文件真实存在，会优先创建 U-Net 分割器；文件不存在时使用 ExG 粗分割加 GrabCut 精修。
 
 大多数用户只需先关注 4 个字段：`method` 决定怎么找叶片，`component_policy` 决定多块候选区域如何取舍，`min_leaf_area_ratio` 决定多小的区域会被当作噪点删除，`exclude_border_components` 决定是否排除接触图像边缘的区域。其他参数建议在可视化确实出现问题时再调整。
+
+白色组织筛选发生在主要叶片选定之后，判断依据是颜色饱和度，而不是固定亮度。因此同一阈值可以兼顾较亮的 JPG 和较暗的 RAW 图像。默认 `0.25` 只针对接近白色或灰色的区域；如果叶片本身颜色很浅，应重点检查 `QC_white_tissue_filter_rollback` 和可视化中的红色区域。
 
 ### `features`：特征开关
 
@@ -539,7 +552,7 @@ output/leaf_color_phenotypes_manifest.json
 output/visualizations/<原文件名>_vis.png
 ```
 
-内容包括原图、绿色分割轮廓以及 L*、a*、b*、GLI、DGCI 和最大轮廓面积。当前实现不会生成单独的热力图或纯掩膜文件；需要纯掩膜时请通过 Python API 的 `process_single(..., return_visualization=True)` 获取。
+内容包括原图、绿色叶片轮廓、红色白组织剔除标记，以及 L*、a*、b*、GLI、DGCI、最大轮廓面积和白组织剔除比例。红色区域不会参与颜色、植被指数、纹理和均匀性计算。当前实现不会生成单独的热力图或纯掩膜文件；需要纯掩膜时请通过 Python API 的 `process_single(..., return_visualization=True)` 获取。
 
 ### 失败报告
 
