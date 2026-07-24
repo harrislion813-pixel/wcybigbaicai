@@ -12,7 +12,10 @@ from scripts import batch_extract
 from src.pipeline import LeafColorPipeline
 from src.preprocessing import ImagePreprocessor
 from src.segmentation import BaseSegmenter, GrabCutSegmenter
-from src.utils import find_images, parse_sample_id, write_image_rgb
+from src.utils import (
+    find_images, parse_sample_id, read_image_rgb, split_pairs_by_sample,
+    write_image_rgb,
+)
 
 
 def test_disabled_feature_groups_stay_disabled():
@@ -321,6 +324,12 @@ def test_synthetic_image_runs_through_batch_pipeline(tmp_path):
     assert len(result) == 1
     assert result.loc[0, "QC_mask_area_px"] > 0
     assert output_path.exists()
+    manifest = json.loads(
+        (tmp_path / "phenotypes_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["successful_images"] == 1
+    assert manifest["failed_images"] == 0
+    assert len(manifest["config_sha256"]) == 64
     assert pipeline.last_batch_failures == []
 
 
@@ -344,3 +353,87 @@ def test_all_batch_failures_are_written_to_a_report(tmp_path, monkeypatch):
     assert len(pipeline.last_batch_failures) == 1
     assert failure_path.exists()
     assert "synthetic failure" in failure_path.read_text(encoding="utf-8")
+
+
+def test_sixteen_bit_standard_image_preserves_dynamic_range(tmp_path):
+    image = np.array([[[0, 32768, 65535]]], dtype=np.uint16)
+    bgr = image[..., ::-1]
+    ok, encoded = segmentation_module.cv2.imencode(".png", bgr)
+    assert ok
+    path = tmp_path / "sixteen_bit.png"
+    encoded.tofile(str(path))
+
+    result = read_image_rgb(path, as_float=True)
+
+    assert result.dtype == np.float32
+    assert np.allclose(result[0, 0], [0.0, 32768 / 65535, 1.0])
+
+
+def test_largest_component_policy_is_reflected_in_qc():
+    raw_mask = np.zeros((20, 20), dtype=np.uint8)
+    raw_mask[2:12, 2:12] = 255
+    raw_mask[15:20, 15:20] = 255
+
+    selected = LeafColorPipeline._select_analysis_mask(raw_mask, "largest")
+    qc = LeafColorPipeline._mask_qc(selected, raw_mask=raw_mask)
+
+    assert np.count_nonzero(selected) == 100
+    assert qc["QC_component_count"] == 2
+    assert qc["QC_raw_mask_area_px"] == 125
+    assert np.isclose(qc["QC_largest_component_fraction"], 0.8)
+
+
+def test_single_replicates_do_not_create_all_nan_stat_columns():
+    frame = pd.DataFrame({
+        "sample_id": ["A", "B"],
+        "image_path": ["a.png", "b.png"],
+        "GLI": [0.2, 0.3],
+    })
+
+    result = LeafColorPipeline._aggregate_by_sample(frame, trait_columns=["GLI"])
+
+    assert "GLI_rep_std" not in result.columns
+    assert "GLI_rep_cv" not in result.columns
+    assert result["n_replicates"].tolist() == [1, 1]
+
+
+def test_unknown_segmentation_parameter_is_rejected():
+    with pytest.raises(ValueError, match="Unknown segmentation parameters"):
+        LeafColorPipeline({"segmentation": {"method": "auto", "morph_kernal_size": 5}})
+
+
+def test_segmentation_uses_bounded_proxy_and_restores_mask_size():
+    pipeline = LeafColorPipeline({
+        "segmentation": {"method": "exg", "max_processing_dimension": 256}
+    })
+    seen_shapes = []
+
+    class RecordingSegmenter:
+        def segment(self, image):
+            seen_shapes.append(image.shape)
+            return np.full(image.shape[:2], 255, dtype=np.uint8)
+
+    pipeline.segmenter = RecordingSegmenter()
+    image = np.zeros((400, 800, 3), dtype=np.float32)
+
+    mask = pipeline._segment_image(image)
+
+    assert seen_shapes == [(128, 256, 3)]
+    assert mask.shape == (400, 800)
+
+
+def test_training_split_keeps_sample_replicates_together():
+    pairs = [
+        (Path("A_rep1.jpg"), Path("A_rep1.png")),
+        (Path("A_rep2.jpg"), Path("A_rep2.png")),
+        (Path("B_rep1.jpg"), Path("B_rep1.png")),
+        (Path("B_rep2.jpg"), Path("B_rep2.png")),
+        (Path("C_rep1.jpg"), Path("C_rep1.png")),
+    ]
+
+    train_pairs, val_pairs = split_pairs_by_sample(pairs, seed=7)
+    train_ids = {parse_sample_id(pair[0].name) for pair in train_pairs}
+    val_ids = {parse_sample_id(pair[0].name) for pair in val_pairs}
+
+    assert train_ids.isdisjoint(val_ids)
+    assert train_ids | val_ids == {"A", "B", "C"}

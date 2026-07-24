@@ -12,7 +12,9 @@ input:
 # ---------- 成像参数 ----------
 imaging:
   color_space: "sRGB"           # 目标颜色空间
-  white_balance: "gray_world"   # gray_world | perfect_reflector | gray_card | none
+  white_balance: "none"         # RAW 默认使用相机白平衡；跨批次优先使用统一灰卡增益
+  raw_use_camera_wb: true        # RAW 解码时使用相机记录的白平衡
+  target_illuminant: "D65"      # CIELAB/sRGB 参考光源
   # gray_card_rgb: [0.5, 0.5, 0.5]  # gray_card 模式必填，范围 [0,1]
   bits_per_channel: 16          # 输出位深 (8/16)
 
@@ -27,6 +29,10 @@ color_calibration:
 # ---------- 叶片分割参数 ----------
 segmentation:
   method: "auto"                # auto | unet | grabcut | exg_threshold | sam
+  component_policy: "largest"   # largest | all；largest 取面积最大的植被候选域
+  component_min_exg: 0.30       # 植被候选连通域的最小归一化 ExG
+  max_processing_dimension: 2200  # 分割缩略图最长边；颜色仍按原图统计
+  normalize_illumination: true   # 仅为分割做灰度世界归一化，不改变量化色值
   unet_model: "models/unet_efficientnet_b3.pth"
   device: "cpu"                 # cuda | cpu
   # 传统方法参数
@@ -108,4 +114,7 @@ features:
 output:
   format: "csv"                 # csv | excel | json
   separate_visualization: false # 是否单独生成可视化报告
+  save_raw_table: true          # 聚合时同时保存逐图原始表
+  aggregate_cv: false           # CV 对带符号/近零性状不稳定，默认关闭
+  write_manifest: true          # 保存配置哈希、版本和成功/失败计数
   phenotype_table_name: "leaf_color_phenotypes"

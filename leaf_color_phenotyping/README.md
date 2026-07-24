@@ -4,6 +4,8 @@
 
 如果你是第一次使用，先完成“快速开始”。确认绿色轮廓只围住叶片后，再按“完整运行步骤”处理正式数据。
 
+一句话理解整个流程：**读取图片 → 找出叶片区域 → 只在叶片内计算指标 → 检查绿色轮廓和 QC → 导出表格**。程序不会仅凭文件存在就认为结果可靠，正式分析前仍需要人工抽查分割效果。
+
 ## 目录
 
 1. [先了解三个重要规则](#一先了解三个重要规则)
@@ -25,13 +27,16 @@
 
 ### 1. 正式分析时，一张图最好只有一片主要叶片
 
-项目可以分割一张图中的多个叶片，但不同特征对多叶片的处理方式不同：
+“连通域”是图像中彼此相连的一整块区域。程序可能同时找到叶片、标尺或零散噪点，因此需要通过 `component_policy` 决定哪些区域真正参与计算：
 
-- 颜色、植被指数和纹理特征使用掩膜中的全部叶片像素。
-- `Shape_*` 形状特征只使用面积最大的轮廓。
-- 可视化左上角的 `Area` 也是最大轮廓面积，不是所有轮廓面积之和。
+- 默认 `largest`：先用归一化 ExG（衡量区域绿色程度的指标）排除不像植被的标尺和标签，再选择面积最大的叶片候选区域。
+- 可选 `all`：保留所有通过筛选的候选区域，适合一张图中确实需要统计多片叶的情况。
+- 所有特征、QC 包围框和可视化轮廓始终使用同一最终分析掩膜。
 
-因此，正式表型分析建议先把图像裁成“一张图一片叶”。
+简单来说，默认情况下，一张图最终得到一组“主要叶片”的数值。正式表型分析仍建议先把图像裁成“一张图一片叶”；如果保留多片叶，默认结果只代表程序选中的主要叶片。
+
+注意：本次优化把默认表型白平衡从逐图 `gray_world` 改为 `none`，并把多连通域统计改为统一的
+`largest` 策略。新旧版本的数值口径不同，同一正式数据集应全部重新提取，不要混用旧表和新表。
 
 ### 2. 同一批正式数据不要混用 RAF 和 JPG
 
@@ -85,6 +90,8 @@ python -m pip install -r requirements.txt
 ```
 
 读取 `.RAF`、`.CR2`、`.NEF`、`.ARW` 等 RAW 文件需要 `rawpy`。它已经写在 `requirements.txt` 中。
+
+`requirements.txt` 足够完成日常批量提取。只有在进行特定工作时，才需要额外安装对应文件：训练 U-Net 使用 `requirements-train.txt`，开发测试使用 `requirements-dev.txt`，颜色校准工具使用 `requirements-calibration.txt`，运行 Notebook 使用 `requirements-notebook.txt`。
 
 #### 第 4 步：放入图片
 
@@ -182,10 +189,15 @@ data/raw_images/
 
 ```yaml
 imaging:
-  white_balance: "gray_world"
+  white_balance: "none"
+  raw_use_camera_wb: true
 
 segmentation:
   method: "auto"
+  component_policy: "largest"
+  component_min_exg: 0.30
+  max_processing_dimension: 2200
+  normalize_illumination: true
   device: "cpu"
   grabcut_iterations: 5
   morph_kernel_size: 5
@@ -196,10 +208,15 @@ segmentation:
 output:
   format: "csv"
   separate_visualization: false
+  save_raw_table: true
+  aggregate_cv: false
+  write_manifest: true
   phenotype_table_name: "leaf_color_phenotypes"
 ```
 
 这组参数适用于当前测试图：标尺靠近画面边缘，叶片位于画面内部，而且叶片面积相对整图较小。
+
+这几项可以这样理解：用于计算颜色的图像不再逐张自动重做白平衡；程序会在一个缩小的临时副本上寻找叶片，以提高速度；找到的掩膜会映射回原图，因此最终颜色仍来自原始分辨率像素；一张图有多个候选区域时默认只统计主要叶片。
 
 ### 步骤 4：先做小批量检查
 
@@ -223,8 +240,15 @@ python scripts\batch_extract.py --no-aggregate --visualize --verbose
 
 同时检查 CSV 中的质量控制列：
 
-- `QC_mask_area_px`：所有掩膜像素总数；
-- `QC_mask_area_ratio`：掩膜占整张图的比例；
+第一次使用时，优先看下面 4 项即可：`QC_mask_is_empty` 判断是否完全漏分割，`QC_mask_area_ratio` 判断叶片面积是否异常，`QC_component_count` 判断是否找到多个候选区域，`QC_selected_component_fraction` 判断最终保留了多少候选掩膜。其他列主要用于进一步定位问题。
+
+- `QC_mask_area_px`：最终参与全部特征计算的掩膜像素数；
+- `QC_raw_mask_area_px`：连通域选择前的候选掩膜像素数；
+- `QC_component_count`：候选连通域数量；
+- `QC_selected_component_fraction`：选中叶片占候选掩膜的比例；
+- `QC_largest_component_fraction`：最大候选域占比；
+- `QC_border_contact_ratio`：选中掩膜接触图像边界的像素比例；
+- `QC_mask_area_ratio`：最终掩膜占整张图的比例；
 - `QC_mask_is_empty`：`1` 表示没有识别到叶片；
 - `QC_bbox_x/y/width/height`：所有掩膜的总包围框。
 
@@ -259,14 +283,17 @@ python scripts\batch_extract.py --no-aggregate --visualize --verbose
 python scripts\batch_extract.py --visualize --verbose
 ```
 
-默认汇总会为每个数值性状生成：
+存在多个重复时，默认汇总会为每个数值性状生成：
 
 - 原性状名：重复的均值；
 - `*_rep_std`：重复间标准差；
-- `*_rep_cv`：重复间变异系数；
 - `n_replicates`：重复数量。
 
-建议先保存不聚合的逐图结果完成质控，再生成聚合后的正式结果。
+只有一个重复时不会生成全为空的 `*_rep_std` 列。`aggregate_cv: true`
+可显式开启重复间 CV，但 QC、直方图以及均值接近零的性状不适合使用 CV。
+默认还会自动保存 `<表名>_raw.csv`，用于逐图质控。
+
+例如 `BJC-001_rep1.jpg` 和 `BJC-001_rep2.jpg` 会先各自出现在逐图表中，再在聚合表中合成 `BJC-001` 一行；原性状列保存两次重复的均值，`*_rep_std` 表示两次结果的差异大小。
 
 ### 步骤 8：保存实验记录
 
@@ -294,7 +321,7 @@ python scripts\batch_extract.py [参数]
 |---|---|---|
 | `--config`, `-c` | 项目根目录 `config.yaml` | 指定 YAML 配置文件。相对路径以当前终端目录解析，配置内部路径以配置文件目录解析 |
 | `--input`, `-i` | 读取配置中的 `input.image_dir` | 临时覆盖输入图片目录，会递归查找子目录 |
-| `--output`, `-o` | 根据配置生成输出路径 | 指定 `.csv`、`.json`、`.xlsx` 或 `.xls` 文件 |
+| `--output`, `-o` | 根据配置生成输出路径 | 指定 `.csv`、`.json` 或 `.xlsx` 文件 |
 | `--method`, `-m` | 读取配置 | 可选 `exg`、`grabcut`、`unet`、`sam`、`auto` |
 | `--model` | 读取配置 | U-Net 或 SAM 权重文件路径 |
 | `--device` | 读取配置，通常为 `cpu` | `cpu` 或 `cuda` |
@@ -346,18 +373,25 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 | 字段 | 当前默认值 | 说明 |
 |---|---|---|
 | `color_space` | `sRGB` | 目标颜色空间说明项；读取函数当前固定输出 sRGB |
-| `white_balance` | `gray_world` | 白平衡方法 |
+| `white_balance` | `none` | 表型定量使用的白平衡方法；RAW 默认已使用相机白平衡 |
+| `raw_use_camera_wb` | `true` | RAW 解码时是否应用相机记录的白平衡 |
+| `target_illuminant` | `D65` | sRGB/CIELAB 目标参考光源 |
 | `gray_card_rgb` | 未设置 | `gray_card` 模式必填，格式为 `[R, G, B]`，范围 `[0,1]` |
-| `bits_per_channel` | `16` | 配置说明项；RAW 读取接口当前默认使用 16 bit 后处理 |
+| `bits_per_channel` | `16` | RAW 后处理位深；普通 16-bit PNG/TIFF 也会保留原始动态范围 |
 
 白平衡方法：
 
 | 方法 | 适用情况 | 注意事项 |
 |---|---|---|
-| `gray_world` | 一般批量拍摄，默认推荐 | 假设整幅图平均颜色接近中性灰；大面积单色背景可能影响结果 |
+| `gray_world` | 没有可靠相机/灰卡白平衡时的临时方案 | 会受背景面积影响，不建议逐图用于正式跨批次定量 |
 | `perfect_reflector` | 图中存在可靠高亮白区域 | 使用各通道高百分位值归一化 |
 | `gray_card` | 有人工测得的灰卡 RGB | 最可控，但必须提供 `gray_card_rgb` |
-| `none` | 图像已经完成统一、可靠的白平衡 | 不再做白平衡修正 |
+| `none` | RAW 已使用相机白平衡，或图像已经统一校正 | 默认；不会根据叶片/背景重新改变色值 |
+
+`segmentation.normalize_illumination` 会仅为传统分割生成灰度世界归一化副本，
+不会改变用于颜色特征计算的像素值，因此分割稳定性与表型颜色校正彼此独立。
+
+可以把它理解成两张用途不同的图：一张临时图只负责“把叶片找准”，另一张原始色值图负责“把颜色算准”。前者的光照归一化不会写回后者。
 
 ### `color_calibration`：颜色校准矩阵
 
@@ -371,11 +405,17 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 
 `enabled: true` 但既没有 `matrix` 也没有 `ccm_file` 时，程序会立即报错，避免把未校准数据误当成已校准数据。
 
+白平衡和 CCM 不是一回事：白平衡主要修正光源造成的整体偏色，CCM 用色卡进一步修正相机对不同颜色的响应。没有色卡实测数据时，不要凭空启用 CCM。
+
 ### `segmentation`：叶片分割
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `method` | `auto` | 分割方法 |
+| `component_policy` | `largest` | `largest` 选择面积最大的植被候选域；`all` 使用所有候选域 |
+| `component_min_exg` | `0.30` | `largest` 模式筛选植被候选域的最小归一化 ExG |
+| `max_processing_dimension` | `2200` | 分割代理图最长边；掩膜映射回原图，颜色仍按原始像素计算 |
+| `normalize_illumination` | `true` | 是否仅为分割做灰度世界光照归一化 |
 | `unet_model` | `models/unet_efficientnet_b3.pth` | U-Net 权重路径；内部映射为 `model_path` |
 | `backbone` | 未写，代码默认 `efficientnet-b3` | U-Net 编码器，必须与训练时一致 |
 | `device` | `cpu` | `cpu` 或 `cuda` |
@@ -389,6 +429,8 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 | `model_type` | 未写，SAM 默认 `vit_h` | SAM 模型类型，必须与检查点一致 |
 
 `auto` 有一个重要行为：如果 `unet_model` 指向的文件真实存在，会优先创建 U-Net 分割器；文件不存在时使用 ExG 粗分割加 GrabCut 精修。
+
+大多数用户只需先关注 4 个字段：`method` 决定怎么找叶片，`component_policy` 决定多块候选区域如何取舍，`min_leaf_area_ratio` 决定多小的区域会被当作噪点删除，`exclude_border_components` 决定是否排除接触图像边缘的区域。其他参数建议在可视化确实出现问题时再调整。
 
 ### `features`：特征开关
 
@@ -416,6 +458,9 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 |---|---|---|
 | `format` | `csv` | `csv`、`json` 或 `excel` |
 | `separate_visualization` | `false` | 是否默认保存可视化；命令行 `--visualize` 可临时开启 |
+| `save_raw_table` | `true` | 聚合时是否同时保存逐图原始表 |
+| `aggregate_cv` | `false` | 是否输出重复间 CV；带符号/近零性状默认不建议开启 |
+| `write_manifest` | `true` | 是否保存配置哈希、运行环境及成功/失败计数 |
 | `phenotype_table_name` | `leaf_color_phenotypes` | 未指定输出文件名时的表名 |
 
 如果 `--output` 已带扩展名，扩展名优先决定格式。例如 `--output result.xlsx` 会输出 Excel，即使配置中写的是 CSV。
@@ -448,7 +493,11 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 
 ```text
 output/leaf_color_phenotypes.csv
+output/leaf_color_phenotypes_raw.csv   # 开启聚合时的逐图表
+output/leaf_color_phenotypes_manifest.json
 ```
+
+三个文件的用途不同：不带后缀的主表用于样本级统计，`_raw` 表保留每张图片的原始结果以便排查，`_manifest.json` 记录本次运行使用的配置和环境以便复现。如果使用 `--no-aggregate`，主表本身就是逐图结果，不会再生成重复的 `_raw` 表。
 
 主要字段组：
 
@@ -456,6 +505,7 @@ output/leaf_color_phenotypes.csv
 |---|---|
 | `sample_id` | 从文件名或正则表达式得到的样本编号 |
 | `image_path` | 原始图片路径；聚合后保留组内第一条路径 |
+| `image_paths` | 聚合后以分号连接的全部重复图片路径 |
 | `RGB_*` | RGB 均值、归一化比例和通道比值 |
 | `HSV_*` | 色相、饱和度、明度统计 |
 | `CIELAB_*` | L*、a*、b*、色度、色相角、绿度和黄度 |
@@ -465,7 +515,7 @@ output/leaf_color_phenotypes.csv
 | `Chromaticity_*` | CIE xyY、u'v' 色度坐标 |
 | `VARI`、`GLI`、`DGCI` 等 | RGB 植被指数及其标准差、中位数 |
 | `GLCM_*` | 纹理统计 |
-| `Shape_*` | 最大叶片轮廓的形状特征 |
+| `Shape_*` | 与颜色、纹理相同分析掩膜的形状特征 |
 | `Uniformity_*` | CIELAB 颜色均匀性 |
 | `QC_*` | 分割质量控制 |
 
@@ -477,6 +527,9 @@ output/leaf_color_phenotypes.csv
 - `CIELAB_B_mean` 越大，通常越偏黄。
 
 这些指标受相机、光源、白平衡和曝光影响。跨批次比较时必须统一成像流程或使用可靠的颜色校准。
+
+运行清单记录完整配置、SHA-256 配置哈希、Python/依赖版本、输入输出路径及成功/失败数量，
+建议与正式表型表一起归档。
 
 ### 可视化
 
@@ -617,14 +670,18 @@ ImagePreprocessor(
     target_illuminant="D65",
     calibration_method="polynomial",
     polynomial_degree=2,
+    raw_use_camera_wb=True,
+    raw_output_bps=16,
 )
 ```
 
 | 参数 | 说明 |
 |---|---|
-| `target_illuminant` | 目标光源名称；当前主要作为对象设置保存 |
+| `target_illuminant` | 目标光源名称；ColorChecker D50 参考值会先做 Bradford D50→D65 色适应 |
 | `calibration_method` | `linear` 或 `polynomial` |
 | `polynomial_degree` | 多项式 CCM 阶数 |
+| `raw_use_camera_wb` | RAW 解码时是否应用相机白平衡 |
+| `raw_output_bps` | RAW 后处理位深，`8` 或 `16` |
 
 #### 公开方法
 
@@ -639,7 +696,7 @@ ImagePreprocessor(
 | `load_color_correction_matrix(path)` | `.npy/.json/.yaml/.csv/文本` | 读取、校验并保存 CCM |
 | `compute_color_correction_matrix(measured_rgb, reference_lab=None)` | 测得的 `N×3` 色块 RGB；参考 Lab | 最小二乘计算并保存 CCM |
 | `apply_color_correction(img_rgb)` | `float RGB [0,1]` | 应用当前 CCM；未设置 CCM 时返回原图并警告 |
-| `process(image_path, white_balance_method="gray_world", gray_roi=None, apply_ccm=True)` | 图片、白平衡、灰卡值、是否应用 CCM | 返回 `rgb`、`rgb_uint8`、`hsv`、`lab` 字典 |
+| `process(image_path, white_balance_method="none", gray_roi=None, apply_ccm=True, compute_derived=True)` | 图片、白平衡、灰卡值、CCM 与派生空间开关 | 默认返回 `rgb`、`rgb_uint8`、`hsv`、`lab`；批处理会先裁剪再计算 HSV/Lab |
 | `has_color_correction_matrix` | 只读属性 | 是否已经加载或计算 CCM |
 
 ### 8.3 叶片分割：`src.segmentation`
@@ -733,7 +790,8 @@ ImagePreprocessor(
 
 #### `ColorTextureAnalyzer.color_uniformity(lab_img, mask)`
 
-输入 CIELAB 图像和掩膜，返回 L/a/b 标准差、变异系数以及像素到叶片平均 Lab 的 ΔE76 均值和标准差。
+输入 CIELAB 图像和掩膜，返回 L/a/b 标准差、MAD、非负且带近零保护的变异系数，
+以及像素到叶片平均 Lab 的 ΔE76 均值和标准差。
 
 ### 8.7 文件、颜色转换和统计工具：`src.utils`
 
@@ -741,6 +799,7 @@ ImagePreprocessor(
 |---|---|---|
 | `find_images(directory, extensions=...)` | 根目录和扩展名元组 | 递归返回排序后的 `Path` 列表 |
 | `parse_sample_id(filename, pattern=None)` | 文件名；可选正则 | 返回样本 ID；自定义正则必须含捕获组 |
+| `split_pairs_by_sample(pairs, train_fraction=0.8, seed=42)` | 图像/掩膜路径对 | 按样本编号做无重复泄漏的训练/验证划分 |
 | `safe_mkdir(path)` | 目录路径 | 创建目录并返回 `Path` |
 | `read_image_rgb(path, as_float=True)` | 文件路径；是否归一化 | 返回 RGB；浮点模式范围 `[0,1]` |
 | `read_image_gray(path)` | 文件路径 | 返回单通道灰度图 |
@@ -755,7 +814,7 @@ ImagePreprocessor(
 | `rgb_to_chromaticity_uv(img_rgb)` | RGB 图像 | 返回 `u_prime, v_prime` |
 | `channel_stats(channel, percentiles=(...))` | 单通道数组和百分位 | 返回均值、标准差、范围、中位数、偏度、峰度和百分位 |
 | `histogram_features(channel, bins=32)` | `[0,255]` 通道和分箱数 | 返回归一化 `hist_bin_*` |
-| `get_colorchecker_lab_d65()` | 无 | 当前返回内置 ColorChecker D50 数据的近似值；严谨校准应使用验证参考值 |
+| `get_colorchecker_lab_d65()` | 无 | 对内置 ColorChecker D50 数据执行 Bradford 色适应后返回 D65 Lab |
 | `delta_e_76(lab1, lab2)` | 两组 Lab | 返回 CIE76 色差 |
 | `delta_e_94(lab1, lab2, k_L=1, k_C=1, k_H=1)` | Lab 和权重 | 返回 CIE94 色差 |
 | `delta_e_2000(lab1, lab2)` | 两组 Lab | 返回 CIEDE2000；大图逐像素计算较慢 |
@@ -787,9 +846,15 @@ data/train/
 - 掩膜与图片主文件名必须一致。
 - 掩膜是单通道二值图：背景 `0`，叶片 `255`。
 - 掩膜优先使用 PNG，也接受同名 JPG。
-- 至少需要 2 对图像和掩膜；实际训练应准备更多且覆盖真实拍摄差异。
+- 至少需要 2 个不同 `sample_id`；同一样本的重复图片会被放在同一数据子集，避免验证泄漏。
 
 ### 2. 开始训练
+
+先安装训练依赖：
+
+```powershell
+python -m pip install -r requirements-train.txt
+```
 
 有 NVIDIA CUDA 环境：
 
@@ -827,7 +892,11 @@ python scripts\train_segmentation.py --images data\train\images --masks data\tra
 | `--device` | `cuda` | `cuda` 或 `cpu`；请求 CUDA 但不可用时会报错 |
 | `--output` | `models/unet_leaf.pth` | 最佳 IoU 权重保存路径 |
 
-训练按固定随机种子划分 80% 训练集和 20% 验证集，保存验证 IoU 最好的模型，并在同名 JSON 文件中保存训练历史。
+训练按解析后的 `sample_id` 做约 80%/20% 分组划分，同一样本的重复图片不会跨入训练集和验证集。
+最佳检查点会同时保存 `state_dict`、backbone、输入尺寸、ImageNet 归一化参数、阈值和最佳验证 IoU；
+同名 JSON 文件保存训练历史。至少需要两个不同的样本编号才能进行无泄漏验证。
+
+这里按样本分组而不是随机按图片划分，是为了避免同一片叶的重复照片同时出现在训练集和验证集中。否则验证分数可能看起来很高，但不能真实反映模型处理新样本的能力。
 
 ### 3. 在配置中启用模型
 
@@ -860,6 +929,8 @@ segmentation:
 ## 十、颜色校准
 
 颜色校准不是“打开开关就自动完成”。当前项目能够加载、计算和应用 CCM，但自动寻找 ColorChecker 的函数仍是预留接口。
+
+如果只是固定相机和光源下做同一批次的相对比较，优先保证拍摄条件一致并保留校准参考图；如果要比较不同时间、不同设备或不同光源下的绝对颜色，才更需要经过验证的 CCM。无论哪种情况，都不要用未经验证的矩阵替代实际校准。
 
 可靠流程是：
 
@@ -967,7 +1038,7 @@ min_leaf_area_ratio: 0.002
 
 - `unet_model` 路径错误；
 - `backbone` 与训练时不一致；
-- 权重文件不是该项目保存的 `state_dict`；
+- 权重文件既不是旧版纯 `state_dict`，也不是新版带元数据的检查点；
 - `torch` 或 `segmentation-models-pytorch` 未正确安装。
 
 ### CUDA 不可用
@@ -1015,6 +1086,9 @@ leaf_color_phenotyping/
 ├── config.yaml
 ├── requirements.txt
 ├── requirements-dev.txt
+├── requirements-train.txt
+├── requirements-calibration.txt
+├── requirements-notebook.txt
 ├── README.md
 ├── data/
 │   ├── raw_images/              # 输入图片
@@ -1042,10 +1116,10 @@ leaf_color_phenotyping/
 └── tests/                       # 自动测试
 ```
 
-`notebooks/demo_pipeline.ipynb` 是探索性示例，不是批处理所必需。其统计分析单元还会使用 `scikit-learn` 和 `statsmodels`；如果要运行这些单元，需要另行安装：
+`notebooks/demo_pipeline.ipynb` 是探索性示例，不是批处理所必需。运行 Notebook 前安装：
 
 ```powershell
-python -m pip install scikit-learn statsmodels
+python -m pip install -r requirements-notebook.txt
 ```
 
 ### 最推荐的日常命令

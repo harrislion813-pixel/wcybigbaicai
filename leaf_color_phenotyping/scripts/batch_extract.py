@@ -63,7 +63,7 @@ def parse_args():
     parser.add_argument("--white-balance", "-wb", type=str,
                         default=None,
                         choices=["gray_world", "perfect_reflector", "gray_card", "none"],
-                        help="白平衡方法（未指定时读取配置，默认 gray_world）")
+                        help="白平衡方法（未指定时读取配置，默认 none）")
     parser.add_argument("--id-pattern", type=str, default=None,
                         help="样本ID正则提取模式 (e.g. '(\\\\w+)_rep')")
     parser.add_argument("--no-aggregate", action="store_true",
@@ -137,7 +137,7 @@ def main():
 
     effective_method = config.get("segmentation", {}).get("method", "exg")
     effective_white_balance = (
-        args.white_balance or config.get("imaging", {}).get("white_balance", "gray_world")
+        args.white_balance or config.get("imaging", {}).get("white_balance", "none")
     )
     gray_roi = config.get("imaging", {}).get("gray_card_rgb")
     save_visualizations = (

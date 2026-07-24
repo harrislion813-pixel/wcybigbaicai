@@ -59,6 +59,9 @@ class VegetationIndexExtractor:
             "VEG": self._veg,
             "COM": self._com,
         }
+        unknown = sorted(set(self.indices) - set(self._compute_fn))
+        if unknown:
+            raise ValueError(f"Unknown vegetation indices: {unknown}")
 
     def compute(self, img_rgb: np.ndarray,
                 mask: Optional[np.ndarray] = None) -> Dict[str, float]:
@@ -77,28 +80,35 @@ class VegetationIndexExtractor:
             img = img_rgb.astype(np.float32)
 
         R, G, B = img[..., 0], img[..., 1], img[..., 2]
+        if mask is not None:
+            if mask.max() > 1:
+                mask_bin = mask > 127
+            else:
+                mask_bin = mask > 0.5
+            # Work only on leaf pixels. This avoids allocating one full-resolution
+            # index map per formula when the leaf occupies a small part of the frame.
+            R, G, B = R[mask_bin], G[mask_bin], B[mask_bin]
+        else:
+            R, G, B = R.ravel(), G.ravel(), B.ravel()
 
         results = {}
         for idx_name in self.indices:
-            if idx_name not in self._compute_fn:
-                continue
-            idx_map = self._compute_fn[idx_name](R, G, B)
-            if mask is not None:
-                if mask.max() > 1:
-                    mask_bin = mask > 127
-                else:
-                    mask_bin = mask > 0.5
-                vals = idx_map[mask_bin]
-            else:
-                vals = idx_map.ravel()
+            vals = self._compute_fn[idx_name](R, G, B)
 
-            if len(vals) == 0:
+            if vals.size == 0:
                 results[idx_name] = np.nan
                 continue
 
-            results[idx_name] = float(vals.mean())
-            results[f"{idx_name}_std"] = float(vals.std())
-            results[f"{idx_name}_median"] = float(np.median(vals))
+            finite = vals[np.isfinite(vals)]
+            if finite.size == 0:
+                results[idx_name] = np.nan
+                results[f"{idx_name}_std"] = np.nan
+                results[f"{idx_name}_median"] = np.nan
+                continue
+
+            results[idx_name] = float(finite.mean())
+            results[f"{idx_name}_std"] = float(finite.std())
+            results[f"{idx_name}_median"] = float(np.median(finite))
 
         return results
 

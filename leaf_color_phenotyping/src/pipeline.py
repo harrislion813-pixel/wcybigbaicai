@@ -6,7 +6,13 @@
     - 批量处理: 用于大规模GWAS表型数据生成
     - 多重复合并: 按样本ID汇总多张图像 → 均值±SD
 """
+import hashlib
+import json
+import platform
+import sys
 import time
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -21,7 +27,10 @@ from .vegetation_indices import VegetationIndexExtractor
 from .texture_features import (
     GLCMTextureExtractor, LeafShapeExtractor, ColorTextureAnalyzer
 )
-from .utils import find_images, parse_sample_id, safe_mkdir, write_image_rgb
+from .utils import (
+    find_images, parse_sample_id, rgb_to_hsv, rgb_to_lab, safe_mkdir,
+    write_image_rgb,
+)
 
 
 _SEGMENTATION_ALIASES = {
@@ -56,13 +65,24 @@ class LeafColorPipeline:
                     若为 None, 使用默认配置.
         """
         self.config = config or {}
+        self._validate_config(self.config)
 
         imaging = self.config.get("imaging", {})
-        self.default_white_balance = imaging.get("white_balance", "gray_world")
+        self.default_white_balance = imaging.get("white_balance", "none")
         gray_card_rgb = imaging.get("gray_card_rgb")
         self.default_gray_roi = (
             np.asarray(gray_card_rgb, dtype=np.float32)
             if gray_card_rgb is not None else None
+        )
+
+        segmentation = self.config.get("segmentation", {})
+        self.component_policy = segmentation.get("component_policy", "largest")
+        self.component_min_exg = float(segmentation.get("component_min_exg", 0.30))
+        self.max_segmentation_dimension = segmentation.get(
+            "max_processing_dimension", 2200
+        )
+        self.normalize_segmentation_illumination = segmentation.get(
+            "normalize_illumination", True
         )
 
         # ---- 初始化各模块 ----
@@ -81,13 +101,68 @@ class LeafColorPipeline:
             raise ValueError("output.format must be one of: csv, excel, json")
         self.output_table_name = output.get("phenotype_table_name", "leaf_color_phenotypes")
         self.default_save_visualizations = output.get("separate_visualization", False)
+        self.save_raw_table = output.get("save_raw_table", True)
+        self.aggregate_cv = output.get("aggregate_cv", False)
+        self.write_manifest = output.get("write_manifest", True)
         self.last_batch_failures: List[Dict[str, str]] = []
+
+    @staticmethod
+    def _validate_config(config: Dict) -> None:
+        """Validate high-impact configuration fields before any image is processed."""
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dictionary")
+
+        imaging = config.get("imaging", {})
+        if not isinstance(imaging, dict):
+            raise TypeError("imaging config must be a mapping")
+        white_balance = imaging.get("white_balance", "none")
+        if white_balance not in {"gray_world", "perfect_reflector", "gray_card", "none"}:
+            raise ValueError(f"Unknown white balance method: {white_balance}")
+        if imaging.get("bits_per_channel", 16) not in (8, 16):
+            raise ValueError("imaging.bits_per_channel must be 8 or 16")
+
+        segmentation = config.get("segmentation", {})
+        if not isinstance(segmentation, dict):
+            raise TypeError("segmentation config must be a mapping")
+        if segmentation.get("component_policy", "largest") not in {"largest", "all"}:
+            raise ValueError("segmentation.component_policy must be 'largest' or 'all'")
+        component_min_exg = segmentation.get("component_min_exg", 0.30)
+        if not isinstance(component_min_exg, (int, float)) or not -1 <= component_min_exg <= 2:
+            raise ValueError("segmentation.component_min_exg must be in [-1, 2]")
+        max_dimension = segmentation.get("max_processing_dimension", 2200)
+        if max_dimension is not None and (
+            not isinstance(max_dimension, int) or max_dimension < 256
+        ):
+            raise ValueError(
+                "segmentation.max_processing_dimension must be null or an integer >= 256"
+            )
+        if not isinstance(segmentation.get("normalize_illumination", True), bool):
+            raise TypeError("segmentation.normalize_illumination must be boolean")
+
+        features = config.get("features", {})
+        if not isinstance(features, dict):
+            raise TypeError("features config must be a mapping")
+        valid_spaces = {"RGB", "HSV", "CIELAB", "YCbCr"}
+        unknown_spaces = set(features.get("color_spaces", valid_spaces)) - valid_spaces
+        if unknown_spaces:
+            raise ValueError(f"Unknown color spaces: {sorted(unknown_spaces)}")
+
+        output = config.get("output", {})
+        if not isinstance(output, dict):
+            raise TypeError("output config must be a mapping")
+        for key in ("separate_visualization", "save_raw_table", "aggregate_cv", "write_manifest"):
+            if key in output and not isinstance(output[key], bool):
+                raise TypeError(f"output.{key} must be boolean")
 
     def _init_preprocessor(self) -> ImagePreprocessor:
         calib = self.config.get("color_calibration", {})
+        imaging = self.config.get("imaging", {})
         preprocessor = ImagePreprocessor(
+            target_illuminant=imaging.get("target_illuminant", "D65"),
             calibration_method=calib.get("method", "polynomial"),
             polynomial_degree=calib.get("polynomial_degree", 2),
+            raw_use_camera_wb=imaging.get("raw_use_camera_wb", True),
+            raw_output_bps=imaging.get("bits_per_channel", 16),
         )
         if not calib.get("enabled", False):
             return preprocessor
@@ -115,7 +190,10 @@ class LeafColorPipeline:
         method = seg.get("method", "exg")
         kwargs = {}
         for key, value in seg.items():
-            if key == "method":
+            if key in {
+                "method", "component_policy", "max_processing_dimension",
+                "normalize_illumination", "component_min_exg",
+            }:
                 continue
             kwargs[_SEGMENTATION_ALIASES.get(key, key)] = value
         if method == "sam" and "model_path" in kwargs and "sam_checkpoint" not in kwargs:
@@ -180,7 +258,8 @@ class LeafColorPipeline:
                        metadata: Optional[Dict] = None,
                        white_balance: Optional[str] = None,
                        gray_roi: Optional[np.ndarray] = None,
-                       return_visualization: bool = False
+                       return_visualization: bool = False,
+                       verbose: bool = True,
                        ) -> Dict[str, object]:
         """处理单张叶片图像, 提取完整叶色表型.
 
@@ -219,30 +298,66 @@ class LeafColorPipeline:
         wb_method = white_balance or self.default_white_balance
         wb_gray_roi = gray_roi if gray_roi is not None else self.default_gray_roi
         preprocessed = self.preprocessor.process(
-            str(img_path), white_balance_method=wb_method, gray_roi=wb_gray_roi
+            str(img_path),
+            white_balance_method=wb_method,
+            gray_roi=wb_gray_roi,
+            compute_derived=False,
         )
         img_rgb = preprocessed["rgb"]
         img_uint8 = preprocessed["rgb_uint8"]
-        img_lab = preprocessed["lab"]
 
         # ---- Step 2: 分割 ----
-        mask = self.segmenter.segment(img_rgb)
-        mask_qc = self._mask_qc(mask)
+        segmentation_rgb = img_rgb
+        if self.normalize_segmentation_illumination:
+            segmentation_rgb = self.preprocessor.white_balance_gray_world(img_rgb)
+        raw_mask = self._segment_image(segmentation_rgb)
+        mask = self._select_analysis_mask(
+            raw_mask,
+            self.component_policy,
+            img_rgb=segmentation_rgb,
+            min_exg=self.component_min_exg,
+        )
+        mask_qc = self._mask_qc(mask, raw_mask=raw_mask)
+
+        # Feature extraction works on the leaf bounding box at original pixel
+        # resolution. This preserves color values while avoiding repeated
+        # full-frame transforms when the leaf occupies only a small area.
+        feature_views = self._crop_to_mask(
+            mask,
+            rgb=img_rgb,
+            rgb_uint8=img_uint8,
+        )
+        feature_mask = feature_views.pop("mask")
+        feature_lab = rgb_to_lab(feature_views["rgb"])
+        feature_hsv = rgb_to_hsv(feature_views["rgb"])
 
         # ---- Step 3: 颜色特征 ----
-        color_feats = self.color_extractor.extract(img_uint8, mask)
+        color_feats = self.color_extractor.extract(
+            feature_views["rgb"],
+            feature_mask,
+            precomputed={
+                "CIELAB": feature_lab,
+                "HSV": feature_hsv,
+            },
+        )
 
         # ---- Step 4: 植被指数 ----
-        veg_feats = self.veg_index_extractor.compute(img_rgb, mask)
+        veg_feats = self.veg_index_extractor.compute(feature_views["rgb"], feature_mask)
 
         # ---- Step 5: 纹理特征 ----
-        texture_feats = self.texture_extractor.compute(img_uint8, mask)
+        texture_feats = self.texture_extractor.compute(
+            feature_views["rgb_uint8"], feature_mask
+        )
 
         # ---- Step 6: 形状特征 ----
-        shape_feats = self.shape_extractor.compute(mask)
+        shape_feats = self.shape_extractor.compute(
+            mask, component_policy=self.component_policy
+        )
 
         # ---- Step 7: 颜色均匀性 ----
-        uniformity_feats = self.color_texture_analyzer.color_uniformity(img_lab, mask)
+        uniformity_feats = self.color_texture_analyzer.color_uniformity(
+            feature_lab, feature_mask
+        )
 
         # ---- 汇总所有特征 ----
         all_features: Dict[str, float] = {}
@@ -276,7 +391,11 @@ class LeafColorPipeline:
             )
 
         elapsed = time.time() - t_start
-        print(f"  [{sid}] Processed in {elapsed:.2f}s → {len(all_features)} features extracted")
+        if verbose:
+            print(
+                f"  [{sid}] Processed in {elapsed:.2f}s → "
+                f"{len(all_features)} features extracted"
+            )
 
         return result
 
@@ -343,6 +462,7 @@ class LeafColorPipeline:
                     white_balance=white_balance,
                     gray_roi=gray_roi,
                     return_visualization=save_visualizations,
+                    verbose=verbose,
                 )
                 if save_visualizations and vis_dir is not None and "visualization" in result:
                     write_image_rgb(vis_dir / f"{img_path.stem}_vis.png", result["visualization"])
@@ -369,6 +489,14 @@ class LeafColorPipeline:
                 safe_mkdir(failure_path.parent)
                 pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
                 print(f"Failure report saved to: {failure_path}")
+                if self.write_manifest:
+                    self._save_run_manifest(
+                        output_path=base_path,
+                        image_dir=image_dir,
+                        discovered_images=len(img_paths),
+                        successful_images=0,
+                        output_samples=0,
+                    )
             return pd.DataFrame()
 
         # 构建DataFrame
@@ -385,11 +513,16 @@ class LeafColorPipeline:
             trait_columns.update(rec["features"].keys())
             rows.append(row)
 
-        df = pd.DataFrame(rows)
+        raw_df = pd.DataFrame(rows)
+        df = raw_df
 
         # 按样本ID汇总 (多重复/)
         if group_by_sample:
-            df = self._aggregate_by_sample(df, trait_columns=sorted(trait_columns))
+            df = self._aggregate_by_sample(
+                raw_df,
+                trait_columns=sorted(trait_columns),
+                include_cv=self.aggregate_cv,
+            )
 
         # 保存
         if output_csv or output_dir:
@@ -397,10 +530,27 @@ class LeafColorPipeline:
                 Path(output_dir or ".") / self.output_table_name
             )
             output_path = self._save_table(df, output_path)
+            if group_by_sample and self.save_raw_table:
+                raw_path = output_path.with_name(
+                    f"{output_path.stem}_raw{output_path.suffix}"
+                )
+                self._save_table(raw_df, str(raw_path))
+                if verbose:
+                    print(f"  Per-image table saved to: {raw_path}")
             if self.last_batch_failures:
                 failure_path = output_path.with_name(f"{output_path.stem}_failures.csv")
                 pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
                 print(f"  Failure report saved to: {failure_path}")
+            if self.write_manifest:
+                manifest_path = self._save_run_manifest(
+                    output_path=output_path,
+                    image_dir=image_dir,
+                    discovered_images=len(img_paths),
+                    successful_images=len(records),
+                    output_samples=len(df),
+                )
+                if verbose:
+                    print(f"  Run manifest saved to: {manifest_path}")
             print(f"\nPhenotype table saved to: {output_path}")
             print(f"  Shape: {df.shape[0]} samples × {df.shape[1]} traits")
 
@@ -409,8 +559,79 @@ class LeafColorPipeline:
     # ----------------------------------------------------------
     # 按样本汇总
     # ----------------------------------------------------------
+    def _segment_image(self, img_rgb: np.ndarray) -> np.ndarray:
+        """Segment on a bounded-size proxy and return a full-resolution mask."""
+        height, width = img_rgb.shape[:2]
+        max_dimension = self.max_segmentation_dimension
+        if max_dimension is None or max(height, width) <= max_dimension:
+            return self.segmenter.segment(img_rgb)
+
+        scale = max_dimension / max(height, width)
+        resized = cv2.resize(
+            img_rgb,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        small_mask = self.segmenter.segment(resized)
+        mask = cv2.resize(small_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        return (mask > 0).astype(np.uint8) * 255
+
     @staticmethod
-    def _mask_qc(mask: np.ndarray) -> Dict[str, float]:
+    def _select_analysis_mask(
+        mask: np.ndarray,
+        policy: str,
+        img_rgb: Optional[np.ndarray] = None,
+        min_exg: float = 0.30,
+    ) -> np.ndarray:
+        """Apply the configured connected-component policy consistently."""
+        mask_bin = (mask > (127 if mask.max() > 1 else 0)).astype(np.uint8)
+        if policy == "all" or not np.any(mask_bin):
+            return mask_bin * 255
+        if policy != "largest":
+            raise ValueError(f"Unknown component policy: {policy}")
+
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask_bin, 8)
+        if count <= 1:
+            return mask_bin * 255
+        candidate_labels = list(range(1, count))
+        if img_rgb is not None:
+            red, green, blue = (
+                img_rgb[..., 0], img_rgb[..., 1], img_rgb[..., 2]
+            )
+            total = red + green + blue + 1e-10
+            exg = (2 * green - red - blue) / total
+            vegetation_labels = [
+                label for label in candidate_labels
+                if float(exg[labels == label].mean()) >= min_exg
+            ]
+            if vegetation_labels:
+                candidate_labels = vegetation_labels
+
+        selected_label = max(
+            candidate_labels, key=lambda label: stats[label, cv2.CC_STAT_AREA]
+        )
+        return (labels == selected_label).astype(np.uint8) * 255
+
+    @staticmethod
+    def _crop_to_mask(mask: np.ndarray, **arrays: np.ndarray) -> Dict[str, np.ndarray]:
+        """Crop aligned image arrays to the selected mask bounding box."""
+        mask_bin = mask > (127 if mask.max() > 1 else 0)
+        if not np.any(mask_bin):
+            cropped = {name: array[:1, :1] for name, array in arrays.items()}
+            cropped["mask"] = mask[:1, :1]
+            return cropped
+        x, y, width, height = cv2.boundingRect(mask_bin.astype(np.uint8))
+        cropped = {
+            name: array[y:y + height, x:x + width]
+            for name, array in arrays.items()
+        }
+        cropped["mask"] = mask[y:y + height, x:x + width]
+        return cropped
+
+    @staticmethod
+    def _mask_qc(
+        mask: np.ndarray, raw_mask: Optional[np.ndarray] = None
+    ) -> Dict[str, float]:
         """Summarize segmentation mask quality for downstream filtering."""
         if mask.max() > 1:
             mask_bin = mask > 127
@@ -419,10 +640,40 @@ class LeafColorPipeline:
 
         area_px = int(mask_bin.sum())
         total_px = int(mask_bin.size)
+        raw_mask = mask if raw_mask is None else raw_mask
+        raw_bin = raw_mask > (127 if raw_mask.max() > 1 else 0)
+        component_count, _, component_stats, _ = cv2.connectedComponentsWithStats(
+            raw_bin.astype(np.uint8), 8
+        )
+        component_areas = component_stats[1:, cv2.CC_STAT_AREA]
+        raw_area_px = int(raw_bin.sum())
+        largest_component_area = int(component_areas.max()) if component_areas.size else 0
+
+        border_pixels = np.zeros_like(mask_bin, dtype=bool)
+        border_pixels[0, :] = True
+        border_pixels[-1, :] = True
+        border_pixels[:, 0] = True
+        border_pixels[:, -1] = True
+        border_contact_px = int(np.count_nonzero(mask_bin & border_pixels))
         feats = {
             "QC_mask_area_px": float(area_px),
             "QC_mask_area_ratio": float(area_px / total_px) if total_px else np.nan,
             "QC_mask_is_empty": float(area_px == 0),
+            "QC_raw_mask_area_px": float(raw_area_px),
+            "QC_raw_mask_area_ratio": (
+                float(raw_area_px / total_px) if total_px else np.nan
+            ),
+            "QC_component_count": float(max(0, component_count - 1)),
+            "QC_largest_component_area_px": float(largest_component_area),
+            "QC_largest_component_fraction": (
+                float(largest_component_area / raw_area_px) if raw_area_px else np.nan
+            ),
+            "QC_selected_component_fraction": (
+                float(area_px / raw_area_px) if raw_area_px else np.nan
+            ),
+            "QC_border_contact_ratio": (
+                float(border_contact_px / area_px) if area_px else np.nan
+            ),
         }
 
         if area_px == 0:
@@ -445,7 +696,8 @@ class LeafColorPipeline:
 
     @staticmethod
     def _aggregate_by_sample(df: pd.DataFrame,
-                             trait_columns: Optional[List[str]] = None
+                             trait_columns: Optional[List[str]] = None,
+                             include_cv: bool = False,
                              ) -> pd.DataFrame:
         """按样本ID汇总多重复测量.
 
@@ -464,17 +716,27 @@ class LeafColorPipeline:
                 and pd.api.types.is_numeric_dtype(df[c])
             ]
 
+        groupby = df.groupby("sample_id", dropna=False, sort=True)
+        group_sizes = groupby.size()
+
+        # Do not manufacture hundreds of all-NaN replicate-stat columns when
+        # every sample occurs only once.
+        if group_sizes.max() <= 1:
+            result = df.copy()
+            result["n_replicates"] = 1
+            if "image_path" in result.columns:
+                result["image_paths"] = result["image_path"].astype(str)
+            return result
+
         if not trait_columns:
-            groupby = df.groupby("sample_id", dropna=False, sort=True)
             grouped = groupby.first()
-            grouped["n_replicates"] = groupby.size()
+            grouped["n_replicates"] = group_sizes
             return grouped.reset_index()
 
         missing_traits = [col for col in trait_columns if col not in df.columns]
         if missing_traits:
             raise ValueError(f"Unknown trait columns: {missing_traits}")
 
-        groupby = df.groupby("sample_id", dropna=False, sort=True)
         agg_dict = {col: ["mean", "std"] for col in trait_columns}
         grouped = groupby.agg(agg_dict)
 
@@ -484,21 +746,27 @@ class LeafColorPipeline:
             for col in grouped.columns
         ]
 
-        # 添加变异系数 (CV)
-        cv_columns = {}
-        for col in trait_columns:
-            mean_col = col
-            std_col = f"{col}_rep_std"
-            if mean_col in grouped.columns and std_col in grouped.columns:
-                denominator = grouped[mean_col].abs()
-                cv_columns[f"{col}_rep_cv"] = (
-                    grouped[std_col] / denominator.where(denominator > 1e-10)
+        # CV is opt-in because it is undefined/unstable for signed, zero-centred,
+        # categorical, histogram, and QC traits.
+        if include_cv:
+            cv_columns = {}
+            for col in trait_columns:
+                if col.startswith(("QC_", "Hist_")):
+                    continue
+                mean_col = col
+                std_col = f"{col}_rep_std"
+                if mean_col in grouped.columns and std_col in grouped.columns:
+                    denominator = grouped[mean_col].abs()
+                    cv_columns[f"{col}_rep_cv"] = (
+                        grouped[std_col] / denominator.where(denominator > 1e-6)
+                    )
+            if cv_columns:
+                grouped = pd.concat(
+                    [grouped, pd.DataFrame(cv_columns, index=grouped.index)], axis=1
                 )
-        if cv_columns:
-            grouped = pd.concat([grouped, pd.DataFrame(cv_columns, index=grouped.index)], axis=1)
 
         # 添加重复数
-        n_replicates = groupby.size().rename("n_replicates")
+        n_replicates = group_sizes.rename("n_replicates")
         grouped = pd.concat([grouped, n_replicates], axis=1).copy()
 
         # 保留图像路径、发育阶段和用户元数据等非性状列。
@@ -508,6 +776,11 @@ class LeafColorPipeline:
         ]
         if metadata_columns:
             grouped = grouped.join(groupby[metadata_columns].first())
+        if "image_path" in df.columns:
+            image_paths = groupby["image_path"].agg(
+                lambda values: ";".join(str(value) for value in values)
+            ).rename("image_paths")
+            grouped = grouped.join(image_paths)
 
         return grouped.reset_index()
 
@@ -517,13 +790,12 @@ class LeafColorPipeline:
         suffix_to_format = {
             ".csv": "csv",
             ".xlsx": "excel",
-            ".xls": "excel",
             ".json": "json",
         }
         output_format = suffix_to_format.get(path.suffix.lower(), self.output_format)
         if path.suffix and path.suffix.lower() not in suffix_to_format:
             raise ValueError(
-                f"Unsupported output extension '{path.suffix}'; use .csv, .json, .xlsx, or .xls"
+                f"Unsupported output extension '{path.suffix}'; use .csv, .json, or .xlsx"
             )
         if not path.suffix:
             extension = {"csv": ".csv", "excel": ".xlsx", "json": ".json"}[output_format]
@@ -540,6 +812,54 @@ class LeafColorPipeline:
             except ImportError as exc:
                 raise ImportError("Excel output requires openpyxl>=3.1") from exc
         return path
+
+    def _save_run_manifest(
+        self,
+        output_path: Path,
+        image_dir: str,
+        discovered_images: int,
+        successful_images: int,
+        output_samples: int,
+    ) -> Path:
+        """Write a reproducibility sidecar for a completed batch run."""
+        serialized_config = json.dumps(
+            self.config, sort_keys=True, ensure_ascii=False, default=str
+        )
+        dependency_versions = {}
+        for distribution in (
+            "numpy", "opencv-python-headless", "opencv-python", "pandas",
+            "scikit-image", "rawpy", "torch", "segmentation-models-pytorch",
+        ):
+            try:
+                dependency_versions[distribution] = version(distribution)
+            except PackageNotFoundError:
+                continue
+
+        manifest = {
+            "schema_version": 1,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "input_dir": str(Path(image_dir).resolve()),
+            "output_table": str(output_path.resolve()),
+            "discovered_images": int(discovered_images),
+            "successful_images": int(successful_images),
+            "failed_images": int(len(self.last_batch_failures)),
+            "output_samples": int(output_samples),
+            "component_policy": self.component_policy,
+            "config_sha256": hashlib.sha256(serialized_config.encode("utf-8")).hexdigest(),
+            "config": self.config,
+            "runtime": {
+                "python": sys.version,
+                "platform": platform.platform(),
+                "dependencies": dependency_versions,
+            },
+        }
+        manifest_path = output_path.with_name(f"{output_path.stem}_manifest.json")
+        safe_mkdir(manifest_path.parent)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        return manifest_path
 
     # ----------------------------------------------------------
     # 可视化
@@ -588,8 +908,8 @@ class LeafColorPipeline:
             if np.isnan(val):
                 continue
             text = f"{label}: {fmt.format(val)}"
-            cv2.putText(vis, text, (10, y), font, scale, (255, 255, 255), outline_thickness)
-            cv2.putText(vis, text, (10, y), font, scale, (0, 0, 0), text_thickness)
+            cv2.putText(vis, text, (10, y), font, scale, (0, 0, 0), outline_thickness)
+            cv2.putText(vis, text, (10, y), font, scale, (255, 255, 255), text_thickness)
             y += line_step
 
         return vis

@@ -29,6 +29,12 @@ class BaseSegmenter:
     def __init__(self, morph_kernel_size: int = 5, min_area_ratio: float = 0.002,
                  exclude_border_components: bool = False,
                  border_margin_ratio: float = 0.01):
+        if not isinstance(morph_kernel_size, int) or morph_kernel_size <= 0:
+            raise ValueError("morph_kernel_size must be a positive integer")
+        if not 0 <= min_area_ratio < 1:
+            raise ValueError("min_area_ratio must be in [0, 1)")
+        if not 0 <= border_margin_ratio < 0.5:
+            raise ValueError("border_margin_ratio must be in [0, 0.5)")
         self.morph_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size))
         self.min_area_ratio = min_area_ratio
@@ -132,10 +138,14 @@ class GrabCutSegmenter(BaseSegmenter):
     def __init__(self, iterations: int = 5, morph_kernel_size: int = 5,
                  min_area_ratio: float = 0.002,
                  exclude_border_components: bool = False,
-                 border_margin_ratio: float = 0.01):
+                 border_margin_ratio: float = 0.01,
+                 exg_threshold: float = 0.15,
+                 use_otsu: bool = True):
         super().__init__(morph_kernel_size, min_area_ratio,
                          exclude_border_components, border_margin_ratio)
         self.iterations = iterations
+        self.exg_threshold = exg_threshold
+        self.use_otsu = use_otsu
 
     def segment(self, img_rgb: np.ndarray,
                 rect: Optional[Tuple[int, int, int, int]] = None,
@@ -184,6 +194,8 @@ class GrabCutSegmenter(BaseSegmenter):
     def segment_auto(self, img_rgb: np.ndarray) -> np.ndarray:
         """自动模式: 先ExG粗分割, 再用GrabCut精修."""
         exg_seg = ExGSegmenter(
+            exg_threshold=self.exg_threshold,
+            use_otsu=self.use_otsu,
             morph_kernel_size=self.morph_kernel.shape[0],
             min_area_ratio=self.min_area_ratio,
             exclude_border_components=self.exclude_border_components,
@@ -236,6 +248,8 @@ class UNetSegmenter(BaseSegmenter):
         if self._model is not None:
             return
         import torch
+        if str(self.device).startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available; use device='cpu'")
         try:
             import segmentation_models_pytorch as smp
         except ImportError:
@@ -247,7 +261,19 @@ class UNetSegmenter(BaseSegmenter):
             in_channels=3,
             classes=1,
         )
-        state_dict = torch.load(self.model_path, map_location=self.device)
+        checkpoint = torch.load(self.model_path, map_location=self.device)
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            checkpoint_backbone = checkpoint.get("backbone")
+            if checkpoint_backbone and checkpoint_backbone != self.backbone:
+                raise ValueError(
+                    f"Checkpoint backbone '{checkpoint_backbone}' does not match "
+                    f"configured backbone '{self.backbone}'"
+                )
+            state_dict = checkpoint["state_dict"]
+            self.threshold = float(checkpoint.get("threshold", 0.5))
+        else:
+            state_dict = checkpoint
+            self.threshold = 0.5
         self._model.load_state_dict(state_dict)
         self._model.to(self.device)
         self._model.eval()
@@ -290,7 +316,7 @@ class UNetSegmenter(BaseSegmenter):
 
         # Resize回原始尺寸
         pred_resized = cv2.resize(pred, (w_orig, h_orig))
-        mask = (pred_resized > 0.5).astype(np.uint8) * 255
+        mask = (pred_resized > self.threshold).astype(np.uint8) * 255
 
         return self.postprocess(mask)
 
@@ -378,7 +404,9 @@ class AutoSegmenter(BaseSegmenter):
     def __init__(self, iterations: int = 5, morph_kernel_size: int = 5,
                  min_area_ratio: float = 0.002,
                  exclude_border_components: bool = False,
-                 border_margin_ratio: float = 0.01):
+                 border_margin_ratio: float = 0.01,
+                 exg_threshold: float = 0.15,
+                 use_otsu: bool = True):
         super().__init__(morph_kernel_size, min_area_ratio,
                          exclude_border_components, border_margin_ratio)
         self.grabcut = GrabCutSegmenter(
@@ -387,8 +415,12 @@ class AutoSegmenter(BaseSegmenter):
             min_area_ratio=min_area_ratio,
             exclude_border_components=exclude_border_components,
             border_margin_ratio=border_margin_ratio,
+            exg_threshold=exg_threshold,
+            use_otsu=use_otsu,
         )
         self.exg = ExGSegmenter(
+            exg_threshold=exg_threshold,
+            use_otsu=use_otsu,
             morph_kernel_size=morph_kernel_size,
             min_area_ratio=min_area_ratio,
             exclude_border_components=exclude_border_components,
@@ -412,6 +444,7 @@ def create_segmenter(method: str = "auto", **kwargs) -> BaseSegmenter:
     Returns:
         BaseSegmenter 实例
     """
+    method = str(method).lower()
     method_map = {
         "exg": ExGSegmenter,
         "exg_threshold": ExGSegmenter,
@@ -420,6 +453,9 @@ def create_segmenter(method: str = "auto", **kwargs) -> BaseSegmenter:
         "sam": SAMSegmenter,
         "auto": AutoSegmenter,
     }
+
+    if method == "exg_threshold":
+        kwargs["use_otsu"] = False
 
     if method == "auto":
         # 自动选择: 优先 U-Net, 其次 GrabCut-auto, 兜底 ExG
@@ -434,8 +470,17 @@ def create_segmenter(method: str = "auto", **kwargs) -> BaseSegmenter:
         raise ValueError(f"Unknown segmentation method: {method}. "
                          f"Choose from {list(method_map.keys())} + 'auto'")
 
-    # 过滤出对应类的构造函数参数
+    # Allow parameters that belong to another supported backend so one shared
+    # config can switch methods, but fail on genuinely unknown/typoed keys.
     import inspect
+    known_params = set()
+    for candidate in set(method_map.values()):
+        known_params.update(inspect.signature(candidate.__init__).parameters)
+    known_params.discard("self")
+    unknown_params = sorted(set(kwargs) - known_params)
+    if unknown_params:
+        raise ValueError(f"Unknown segmentation parameters: {unknown_params}")
+
     sig = inspect.signature(seg_cls.__init__)
     valid_params = set(sig.parameters.keys()) - {"self"}
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}

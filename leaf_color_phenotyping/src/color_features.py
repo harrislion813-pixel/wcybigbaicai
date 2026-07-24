@@ -17,8 +17,7 @@ import cv2
 
 from .utils import (
     rgb_to_lab, rgb_to_hsv, rgb_to_ycbcr,
-    rgb_to_chromaticity_xyy, rgb_to_chromaticity_uv,
-    channel_stats, histogram_features,
+    rgb_to_xyz, channel_stats, histogram_features,
 )
 
 
@@ -55,9 +54,19 @@ class ColorFeatureExtractor:
         self.include_color_moments = include_color_moments
         self.include_histogram = include_histogram
         self.include_chromaticity = include_chromaticity
+        valid_spaces = {"RGB", "HSV", "CIELAB", "YCbCr"}
+        unknown_spaces = sorted(set(self.color_spaces) - valid_spaces)
+        if unknown_spaces:
+            raise ValueError(f"Unknown color spaces: {unknown_spaces}")
+        if not isinstance(self.hist_bins, int) or self.hist_bins <= 0:
+            raise ValueError("hist_bins must be a positive integer")
+        if any(not 0 <= percentile <= 100 for percentile in self.hist_percentiles):
+            raise ValueError("hist_percentiles must be within [0, 100]")
 
     def extract(self, img_rgb: np.ndarray,
-                mask: np.ndarray) -> Dict[str, float]:
+                mask: np.ndarray,
+                precomputed: Optional[Dict[str, np.ndarray]] = None
+                ) -> Dict[str, float]:
         """从叶片ROI提取所有颜色特征.
 
         Args:
@@ -86,10 +95,10 @@ class ColorFeatureExtractor:
             mask_bin = (mask > 127).astype(np.uint8)
         else:
             mask_bin = mask.astype(np.uint8)
+        if not np.any(mask_bin):
+            return {}
 
-        # 应用掩膜: 将背景设为NaN
-        mask_3ch = np.repeat(mask_bin[..., np.newaxis], 3, axis=-1).astype(bool)
-
+        precomputed = precomputed or {}
         all_features: Dict[str, float] = {}
 
         # ---- 1. RGB 空间 ----
@@ -98,13 +107,17 @@ class ColorFeatureExtractor:
 
         # ---- 2. HSV 空间 ----
         if "HSV" in self.color_spaces:
-            hsv = rgb_to_hsv(img_float)
+            hsv = precomputed.get("HSV")
+            if hsv is None:
+                hsv = rgb_to_hsv(img_float)
             all_features.update(self._extract_space_features(hsv, mask_bin, "HSV",
                                                              ch_names=["H", "S", "V"]))
 
         # ---- 3. CIELAB 空间 ----
         if "CIELAB" in self.color_spaces:
-            lab = rgb_to_lab(img_float)
+            lab = precomputed.get("CIELAB")
+            if lab is None:
+                lab = rgb_to_lab(img_float)
             all_features.update(self._extract_space_features(lab, mask_bin, "CIELAB",
                                                              ch_names=["L", "A", "B"]))
             # 额外: 色度 C*ab, 色相角 hab
@@ -170,12 +183,24 @@ class ColorFeatureExtractor:
         feats["RGB_RB_ratio"] = (r - b) / (r + b + 1e-10)
 
         # 逐像素比值统计 (生物学上更有意义)
-        pixel_ratios_rg = r_ch / (g_ch + 1e-10)
-        pixel_ratios_bg = b_ch / (g_ch + 1e-10)
-        feats["RGB_R_over_G_mean"] = float(pixel_ratios_rg.mean())
-        feats["RGB_R_over_G_std"] = float(pixel_ratios_rg.std())
-        feats["RGB_B_over_G_mean"] = float(pixel_ratios_bg.mean())
-        feats["RGB_B_over_G_std"] = float(pixel_ratios_bg.std())
+        # Very dark green-channel pixels make ratios numerically unbounded.
+        # Exclude pixels below two 8-bit code values and report the retained share.
+        ratio_floor = 2.0 / 255.0
+        ratio_valid = g_ch > ratio_floor
+        feats["RGB_ratio_valid_fraction"] = float(ratio_valid.mean())
+        if np.any(ratio_valid):
+            pixel_ratios_rg = r_ch[ratio_valid] / g_ch[ratio_valid]
+            pixel_ratios_bg = b_ch[ratio_valid] / g_ch[ratio_valid]
+            feats["RGB_R_over_G_mean"] = float(pixel_ratios_rg.mean())
+            feats["RGB_R_over_G_std"] = float(pixel_ratios_rg.std())
+            feats["RGB_B_over_G_mean"] = float(pixel_ratios_bg.mean())
+            feats["RGB_B_over_G_std"] = float(pixel_ratios_bg.std())
+        else:
+            for name in (
+                "RGB_R_over_G_mean", "RGB_R_over_G_std",
+                "RGB_B_over_G_mean", "RGB_B_over_G_std",
+            ):
+                feats[name] = np.nan
 
         return feats
 
@@ -197,6 +222,19 @@ class ColorFeatureExtractor:
                 ch = ch.astype(np.float32)
 
             stats = channel_stats(ch, self.hist_percentiles)
+            if space_name == "HSV" and name == "H":
+                # OpenCV hue is circular on [0, 180); replace linear mean/std.
+                angles = ch.astype(np.float64) * (2 * np.pi / 180.0)
+                sin_mean = np.sin(angles).mean()
+                cos_mean = np.cos(angles).mean()
+                mean_angle = np.arctan2(sin_mean, cos_mean) % (2 * np.pi)
+                resultant = float(np.hypot(sin_mean, cos_mean))
+                stats["mean"] = float(mean_angle * 180.0 / (2 * np.pi))
+                stats["std"] = float(
+                    np.sqrt(max(0.0, -2.0 * np.log(max(resultant, 1e-12))))
+                    * 180.0 / (2 * np.pi)
+                )
+                stats["circular_variance"] = 1.0 - resultant
             for stat_name, value in stats.items():
                 feats[f"{space_name}_{name}_{stat_name}"] = float(value)
 
@@ -233,14 +271,12 @@ class ColorFeatureExtractor:
         if h_ab_mean < 0:
             h_ab_mean += 360
         feats["CIELAB_hab_mean"] = h_ab_mean
-        feats["CIELAB_hab_std"] = float(np.std(h_ab))
-
-        # a* 和 b* 的统计（补充）
-        for name, ch in [("a", a_ch), ("b", b_ch)]:
-            feats[f"CIELAB_{name}_median"] = float(np.median(ch))
-            feats[f"CIELAB_{name}_skewness"] = float(
-                (ch.mean() - np.median(ch)) / (ch.std() + 1e-10)
-            )
+        resultant = float(np.hypot(sin_mean, cos_mean))
+        feats["CIELAB_hab_std"] = float(
+            np.sqrt(max(0.0, -2.0 * np.log(max(resultant, 1e-12))))
+            * 180.0 / (2 * np.pi)
+        )
+        feats["CIELAB_hab_circular_variance"] = 1.0 - resultant
 
         # 绿度指数: -a* 越大越绿
         feats["CIELAB_greenness"] = float(-a_ch.mean())
@@ -315,9 +351,15 @@ class ColorFeatureExtractor:
         """提取CIE色度坐标特征."""
         feats = {}
 
-        # CIE 1931 xyY
-        x_img, y_img, Y_img = rgb_to_chromaticity_xyy(img)
-        for name, ch in [("x", x_img), ("y", y_img), ("Y", Y_img)]:
+        # Compute XYZ once, then derive both CIE 1931 xyY and CIE 1976 u'v'.
+        xyz = rgb_to_xyz(img)
+        X_img, Y_img, Z_img = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+        total = X_img + Y_img + Z_img + 1e-10
+        x_img = X_img / total
+        y_img = Y_img / total
+        for name, ch in [
+            ("x", x_img), ("y", y_img), ("luminance", Y_img)
+        ]:
             vals = ch[mask > 0]
             if len(vals) == 0:
                 continue
@@ -325,7 +367,9 @@ class ColorFeatureExtractor:
             feats[f"Chromaticity_xyY_{name}_std"] = float(vals.std())
 
         # CIE 1976 u'v'
-        u_img, v_img = rgb_to_chromaticity_uv(img)
+        uv_denom = X_img + 15 * Y_img + 3 * Z_img + 1e-10
+        u_img = 4 * X_img / uv_denom
+        v_img = 9 * Y_img / uv_denom
         for name, ch in [("u_prime", u_img), ("v_prime", v_img)]:
             vals = ch[mask > 0]
             if len(vals) == 0:

@@ -37,7 +37,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from src.segmentation import IMAGENET_MEAN, IMAGENET_STD, normalize_imagenet_rgb
-from src.utils import read_image_gray, read_image_rgb
+from src.utils import read_image_gray, read_image_rgb, split_pairs_by_sample
 
 # 需要额外安装:
 #   pip install segmentation-models-pytorch albumentations
@@ -201,12 +201,15 @@ class BCEDiceLoss(nn.Module):
 # ============================================================
 @torch.no_grad()
 def compute_iou(pred: torch.Tensor, target: torch.Tensor,
-                threshold: float = 0.5) -> float:
+                 threshold: float = 0.5) -> float:
     """计算IoU (Intersection over Union)."""
     pred_bin = (torch.sigmoid(pred) > threshold).float()
-    intersection = (pred_bin * target).sum().item()
-    union = (pred_bin + target).clamp(0, 1).sum().item()
-    return intersection / (union + 1e-8)
+    intersection = (pred_bin * target).sum(dim=(1, 2, 3))
+    union = (pred_bin + target).clamp(0, 1).sum(dim=(1, 2, 3))
+    per_sample = torch.where(
+        union > 0, intersection / union.clamp_min(1e-8), torch.ones_like(union)
+    )
+    return float(per_sample.mean().item())
 
 
 # ============================================================
@@ -219,6 +222,8 @@ def train(args):
 
     torch.manual_seed(42)
     np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
     # ---- 数据 ----
     source_dataset = LeafSegmentationDataset(
@@ -227,21 +232,15 @@ def train(args):
     if len(source_dataset) < 2:
         raise ValueError("At least two image-mask pairs are required for train/validation split")
 
-    # 简单划分: 80/20
-    n_train = max(1, int(len(source_dataset) * 0.8))
-    n_val = len(source_dataset) - n_train
-    split_train, split_val = torch.utils.data.random_split(
-        range(len(source_dataset)), [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
+    train_pairs, val_pairs = split_pairs_by_sample(source_dataset.pairs)
 
     train_dataset = LeafSegmentationDataset(
         args.images, args.masks, image_size=args.image_size, augment=True,
-        pairs=[source_dataset.pairs[i] for i in split_train.indices],
+        pairs=train_pairs,
     )
     val_dataset = LeafSegmentationDataset(
         args.images, args.masks, image_size=args.image_size, augment=False,
-        pairs=[source_dataset.pairs[i] for i in split_val.indices],
+        pairs=val_pairs,
     )
 
     pin_memory = device.type == "cuda"
@@ -320,7 +319,17 @@ def train(args):
             best_iou = val_iou
             output_path = Path(args.output)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), str(output_path))
+            torch.save({
+                "state_dict": model.state_dict(),
+                "backbone": args.backbone,
+                "image_size": list(args.image_size),
+                "normalization": {
+                    "mean": IMAGENET_MEAN.tolist(),
+                    "std": IMAGENET_STD.tolist(),
+                },
+                "threshold": 0.5,
+                "best_val_iou": float(best_iou),
+            }, str(output_path))
             improved = " *"
         else:
             improved = ""

@@ -88,6 +88,36 @@ def parse_sample_id(filename: str, pattern: Optional[str] = None) -> str:
     return stem
 
 
+def split_pairs_by_sample(
+    pairs: List[Tuple[Path, Path]],
+    train_fraction: float = 0.8,
+    seed: int = 42,
+) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Path]]]:
+    """Split image/mask pairs by sample ID to prevent replicate leakage."""
+    if not 0 < train_fraction < 1:
+        raise ValueError("train_fraction must be between 0 and 1")
+    groups: Dict[str, List[Tuple[Path, Path]]] = {}
+    for pair in pairs:
+        sample_id = parse_sample_id(pair[0].name)
+        groups.setdefault(sample_id, []).append(pair)
+    if len(groups) < 2:
+        raise ValueError(
+            "At least two distinct sample IDs are required for a leakage-safe split"
+        )
+
+    sample_ids = np.array(sorted(groups), dtype=object)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(sample_ids)
+    n_train_groups = min(
+        len(sample_ids) - 1,
+        max(1, int(round(len(sample_ids) * train_fraction))),
+    )
+    train_ids = set(sample_ids[:n_train_groups])
+    train_pairs = [pair for sid in train_ids for pair in groups[sid]]
+    val_pairs = [pair for sid in sample_ids[n_train_groups:] for pair in groups[sid]]
+    return train_pairs, val_pairs
+
+
 def safe_mkdir(path: Union[str, Path]) -> Path:
     """安全创建目录."""
     p = Path(path)
@@ -96,28 +126,47 @@ def safe_mkdir(path: Union[str, Path]) -> Path:
 
 
 def read_image_rgb(path: Union[str, Path], as_float: bool = True) -> np.ndarray:
-    """Read an image as RGB, supporting Windows paths with spaces/non-ASCII text."""
+    """Read an image as RGB while preserving the source integer bit depth."""
     data = np.fromfile(str(path), dtype=np.uint8)
     if data.size == 0:
         raise FileNotFoundError(f"无法读取图像: {path}")
-    bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if bgr is None:
+    decoded = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if decoded is None:
         raise FileNotFoundError(f"无法解码图像: {path}")
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    if decoded.ndim == 2:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_GRAY2RGB)
+    elif decoded.shape[2] == 4:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGB)
+    elif decoded.shape[2] == 3:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+    else:
+        raise ValueError(f"不支持的图像通道数: {decoded.shape}")
+
     if as_float:
-        return rgb.astype(np.float32) / 255.0
+        if np.issubdtype(rgb.dtype, np.integer):
+            scale = float(np.iinfo(rgb.dtype).max)
+            return rgb.astype(np.float32) / scale
+        rgb_float = rgb.astype(np.float32)
+        if not np.isfinite(rgb_float).all():
+            raise ValueError(f"图像包含 NaN 或无穷值: {path}")
+        return np.clip(rgb_float, 0.0, 1.0)
     return rgb
 
 
 def read_image_gray(path: Union[str, Path]) -> np.ndarray:
-    """Read an image as grayscale, supporting Windows paths with spaces/non-ASCII text."""
+    """Read a grayscale image while preserving the source integer bit depth."""
     data = np.fromfile(str(path), dtype=np.uint8)
     if data.size == 0:
         raise FileNotFoundError(f"无法读取图像: {path}")
-    gray = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
-    if gray is None:
+    decoded = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if decoded is None:
         raise FileNotFoundError(f"无法解码图像: {path}")
-    return gray
+    if decoded.ndim == 2:
+        return decoded
+    if decoded.shape[2] == 4:
+        return cv2.cvtColor(decoded, cv2.COLOR_BGRA2GRAY)
+    return cv2.cvtColor(decoded, cv2.COLOR_BGR2GRAY)
 
 
 def write_image_rgb(path: Union[str, Path], img_rgb: np.ndarray) -> None:
@@ -366,12 +415,28 @@ BRADFORD_D50_TO_D65 = np.array([
 
 
 def get_colorchecker_lab_d65() -> np.ndarray:
-    """获取 D65 光源下的 ColorChecker 24 参考 Lab 值 (计算值)."""
+    """Adapt built-in ColorChecker Lab values from D50 to D65 using Bradford."""
     lab_d50 = COLORCHECKER_24_LAB_D50
-    # Lab → XYZ (D50)
-    # 简化: 使用 colour-science 库做精确转换, 这里给出近似值
-    # 实际使用时建议直接测量或用 colour-science 转换
-    return lab_d50  # 近似, 实际场景建议配置 reference_file
+    L, a, b = lab_d50[:, 0], lab_d50[:, 1], lab_d50[:, 2]
+    fy = (L + 16) / 116
+    fx = a / 500 + fy
+    fz = fy - b / 200
+    delta = 6 / 29
+
+    def inverse_lab_curve(values: np.ndarray) -> np.ndarray:
+        return np.where(
+            values > delta,
+            values ** 3,
+            3 * delta ** 2 * (values - 4 / 29),
+        )
+
+    xyz_d50 = np.column_stack([
+        inverse_lab_curve(fx) * 0.96422,
+        inverse_lab_curve(fy),
+        inverse_lab_curve(fz) * 0.82521,
+    ])
+    xyz_d65 = (BRADFORD_D50_TO_D65 @ xyz_d50.T).T
+    return xyz_to_lab(xyz_d65[:, np.newaxis, :])[:, 0, :].astype(np.float64)
 
 
 # ============================================================

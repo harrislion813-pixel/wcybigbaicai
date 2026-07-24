@@ -51,6 +51,17 @@ class GLCMTextureExtractor:
             "energy", "correlation", "ASM"
         ]
         self.properties = default_properties if properties is None else list(properties)
+        if not self.distances or any(
+            not isinstance(distance, int) or distance <= 0
+            for distance in self.distances
+        ):
+            raise ValueError("GLCM distances must be positive integers")
+        if not isinstance(self.levels, int) or not 2 <= self.levels <= 256:
+            raise ValueError("GLCM levels must be an integer in [2, 256]")
+        valid_properties = set(default_properties)
+        unknown_properties = sorted(set(self.properties) - valid_properties)
+        if unknown_properties:
+            raise ValueError(f"Unknown GLCM properties: {unknown_properties}")
 
     def compute(self, img_rgb: np.ndarray,
                 mask: Optional[np.ndarray] = None) -> Dict[str, float]:
@@ -75,6 +86,7 @@ class GLCMTextureExtractor:
         gray = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2GRAY)
 
         # 掩膜应用
+        mask_crop = None
         if mask is not None:
             if mask.max() > 1:
                 mask_bin = mask > 127
@@ -90,23 +102,26 @@ class GLCMTextureExtractor:
             x, y, w, h = cv2.boundingRect(mask_bin.astype(np.uint8))
             gray = gray[y:y + h, x:x + w].copy()
             mask_crop = mask_bin[y:y + h, x:x + w]
-            fill_value = int(np.median(gray[mask_crop]))
-            gray = gray.copy()
-            gray[~mask_crop] = fill_value
 
         # 降级加速 (256 → 64 灰度级)
         if self.levels < 256:
             gray = (gray.astype(np.float64) * (self.levels - 1) / 255).astype(np.uint8)
 
         # 计算GLCM
-        glcm = graycomatrix(
-            gray,
-            distances=self.distances,
-            angles=self.angles_rad,
-            levels=self.levels,
-            symmetric=True,
-            normed=True,
-        )  # shape: (levels, levels, n_distances, n_angles)
+        if mask_crop is None:
+            glcm = graycomatrix(
+                gray,
+                distances=self.distances,
+                angles=self.angles_rad,
+                levels=self.levels,
+                symmetric=True,
+                normed=True,
+            )
+            valid_pairs = np.ones(
+                (len(self.distances), len(self.angles_rad)), dtype=bool
+            )
+        else:
+            glcm, valid_pairs = self._masked_graycomatrix(gray, mask_crop)
 
         # 提取属性
         feats: Dict[str, float] = {}
@@ -115,17 +130,74 @@ class GLCMTextureExtractor:
             try:
                 prop_array = graycoprops(glcm, prop)
                 # shape: (n_distances, n_angles)
-                feats[f"GLCM_{prop}_mean"] = float(prop_array.mean())
-                feats[f"GLCM_{prop}_std"] = float(prop_array.std())
+                prop_array = prop_array.astype(np.float64)
+                prop_array[~valid_pairs] = np.nan
+                finite_values = prop_array[np.isfinite(prop_array)]
+                feats[f"GLCM_{prop}_mean"] = (
+                    float(finite_values.mean()) if finite_values.size else np.nan
+                )
+                feats[f"GLCM_{prop}_std"] = (
+                    float(finite_values.std()) if finite_values.size else np.nan
+                )
 
                 # 各距离汇总
                 for d_idx, d in enumerate(self.distances):
                     vals = prop_array[d_idx, :]  # 该距离下所有角度
-                    feats[f"GLCM_{prop}_d{d}_mean"] = float(vals.mean())
-            except Exception:
+                    vals = vals[np.isfinite(vals)]
+                    feats[f"GLCM_{prop}_d{d}_mean"] = (
+                        float(vals.mean()) if vals.size else np.nan
+                    )
+            except ValueError:
                 feats[f"GLCM_{prop}_mean"] = np.nan
 
         return feats
+
+    def _masked_graycomatrix(
+        self, gray: np.ndarray, mask: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build GLCMs using only pixel pairs whose endpoints are both in-mask."""
+        n_distances = len(self.distances)
+        n_angles = len(self.angles_rad)
+        glcm = np.zeros(
+            (self.levels, self.levels, n_distances, n_angles), dtype=np.float64
+        )
+        valid_pairs = np.zeros((n_distances, n_angles), dtype=bool)
+        height, width = gray.shape
+
+        for d_idx, distance in enumerate(self.distances):
+            for a_idx, angle in enumerate(self.angles_rad):
+                dx = int(round(np.cos(angle) * distance))
+                dy = int(round(np.sin(angle) * distance))
+                if abs(dx) >= width or abs(dy) >= height:
+                    continue
+
+                if dx >= 0:
+                    src_x, dst_x = slice(0, width - dx), slice(dx, width)
+                else:
+                    src_x, dst_x = slice(-dx, width), slice(0, width + dx)
+                if dy >= 0:
+                    src_y, dst_y = slice(0, height - dy), slice(dy, height)
+                else:
+                    src_y, dst_y = slice(-dy, height), slice(0, height + dy)
+
+                pair_mask = mask[src_y, src_x] & mask[dst_y, dst_x]
+                if not np.any(pair_mask):
+                    continue
+
+                source = gray[src_y, src_x][pair_mask].astype(np.int64)
+                target = gray[dst_y, dst_x][pair_mask].astype(np.int64)
+                counts = np.bincount(
+                    source * self.levels + target,
+                    minlength=self.levels * self.levels,
+                ).reshape(self.levels, self.levels).astype(np.float64)
+                counts += counts.T
+                total = counts.sum()
+                if total <= 0:
+                    continue
+                glcm[:, :, d_idx, a_idx] = counts / total
+                valid_pairs[d_idx, a_idx] = True
+
+        return glcm, valid_pairs
 
 
 class LeafShapeExtractor:
@@ -151,9 +223,13 @@ class LeafShapeExtractor:
             "major_axis_length", "minor_axis_length"
         ]
         self.features = default_features if features is None else list(features)
+        unknown_features = sorted(set(self.features) - set(default_features))
+        if unknown_features:
+            raise ValueError(f"Unknown shape features: {unknown_features}")
 
     def compute(self, mask: np.ndarray,
-                pixel_scale: Optional[float] = None) -> Dict[str, float]:
+                pixel_scale: Optional[float] = None,
+                component_policy: str = "largest") -> Dict[str, float]:
         """计算叶片形状特征.
 
         Args:
@@ -172,18 +248,23 @@ class LeafShapeExtractor:
         else:
             mask_bin = mask.astype(np.uint8)
 
-        # 找最大连通域 (假设最大的就是目标叶片)
+        if component_policy not in {"largest", "all"}:
+            raise ValueError("component_policy must be 'largest' or 'all'")
+
         contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return {f"Shape_{f}": np.nan for f in self.features}
 
-        # 取最大轮廓
-        contour = max(contours, key=cv2.contourArea)
+        if component_policy == "largest":
+            selected_contours = [max(contours, key=cv2.contourArea)]
+        else:
+            selected_contours = contours
+        contour = np.vstack(selected_contours)
 
         # 基础量
-        area_px = cv2.contourArea(contour)
-        perimeter_px = cv2.arcLength(contour, True)
+        area_px = sum(cv2.contourArea(item) for item in selected_contours)
+        perimeter_px = sum(cv2.arcLength(item, True) for item in selected_contours)
 
         feats: Dict[str, float] = {}
 
@@ -270,9 +351,15 @@ class ColorTextureAnalyzer:
             if len(ch) == 0:
                 feats[f"Uniformity_{name}_std"] = np.nan
                 feats[f"Uniformity_CV_{name}"] = np.nan
+                feats[f"Uniformity_{name}_MAD"] = np.nan
                 continue
             feats[f"Uniformity_{name}_std"] = float(ch.std())
-            feats[f"Uniformity_CV_{name}"] = float(ch.std() / (ch.mean() + 1e-10))
+            mean_abs = abs(float(ch.mean()))
+            feats[f"Uniformity_CV_{name}"] = (
+                float(ch.std() / mean_abs) if mean_abs > 1.0 else np.nan
+            )
+            median = float(np.median(ch))
+            feats[f"Uniformity_{name}_MAD"] = float(np.median(np.abs(ch - median)))
 
         # 像素级色差 (逐像素与均值Lab的ΔE76)
         if lab_img[mask_bin].size > 0:

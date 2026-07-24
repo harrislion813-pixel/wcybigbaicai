@@ -13,7 +13,7 @@ import cv2
 
 from .utils import (
     COLORCHECKER_24_LAB_D50, rgb_to_lab, delta_e_76, safe_mkdir,
-    RAW_IMAGE_EXTENSIONS, read_image_rgb,
+    RAW_IMAGE_EXTENSIONS, read_image_rgb, BRADFORD_D50_TO_D65,
 )
 
 
@@ -23,19 +23,27 @@ class ImagePreprocessor:
     def __init__(self,
                  target_illuminant: str = "D65",
                  calibration_method: str = "polynomial",
-                 polynomial_degree: int = 2):
+                 polynomial_degree: int = 2,
+                 raw_use_camera_wb: bool = True,
+                 raw_output_bps: int = 16):
         """
         Args:
-            target_illuminant: 目标光源 ("D50", "D65", "A")
+            target_illuminant: 目标光源；当前 sRGB/CIELAB 管线仅支持 "D65"
             calibration_method: 颜色校正方法
                 - "linear": 3×3 线性回归
                 - "polynomial": 多项式回归 (推荐)
                 - "root_polynomial": 根多项式回归
             polynomial_degree: 多项式阶数 (method="polynomial" 时有效)
         """
-        self.target_illuminant = target_illuminant
+        if str(target_illuminant).upper() != "D65":
+            raise ValueError("target_illuminant currently supports only D65")
+        self.target_illuminant = "D65"
         self.calibration_method = calibration_method
         self.polynomial_degree = polynomial_degree
+        self.raw_use_camera_wb = bool(raw_use_camera_wb)
+        if raw_output_bps not in (8, 16):
+            raise ValueError("raw_output_bps must be 8 or 16")
+        self.raw_output_bps = raw_output_bps
         self._ccm: Optional[np.ndarray] = None  # 颜色校正矩阵
 
     @property
@@ -279,9 +287,10 @@ class ImagePreprocessor:
     # ----------------------------------------------------------
     def process(self,
                 image_path: str,
-                white_balance_method: str = "gray_world",
+                white_balance_method: str = "none",
                 gray_roi: Optional[np.ndarray] = None,
-                apply_ccm: bool = True) -> Dict[str, np.ndarray]:
+                apply_ccm: bool = True,
+                compute_derived: bool = True) -> Dict[str, np.ndarray]:
         """完整的图像预处理流水线.
 
         Args:
@@ -289,6 +298,7 @@ class ImagePreprocessor:
             white_balance_method: "gray_world" | "perfect_reflector" | "gray_card" | "none"
             gray_roi: white_balance_method="gray_card" 时需提供灰卡ROI的RGB均值
             apply_ccm: 是否应用已计算的CCM
+            compute_derived: 是否同时计算 HSV 和 CIELAB；批处理可在裁剪后再计算
 
         Returns:
             {"rgb": ..., "lab": ..., "hsv": ...} 预处理后的多色彩空间图像
@@ -296,7 +306,15 @@ class ImagePreprocessor:
         # Step 1: 读取
         ext = Path(image_path).suffix.lower()
         if ext in RAW_IMAGE_EXTENSIONS:
-            img = self.read_raw(image_path)
+            if self.raw_use_camera_wb and self.raw_output_bps == 16:
+                # Preserve the historical one-argument call for the default path.
+                img = self.read_raw(image_path)
+            else:
+                img = self.read_raw(
+                    image_path,
+                    use_camera_wb=self.raw_use_camera_wb,
+                    output_bps=self.raw_output_bps,
+                )
         else:
             img = self.read_image(image_path)
 
@@ -322,13 +340,16 @@ class ImagePreprocessor:
         # Step 4: 多色彩空间输出
         img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
 
-        return {
+        result = {
             "rgb": img,
             "rgb_uint8": img_uint8,
-            "hsv": cv2.cvtColor(cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR),
-                                cv2.COLOR_BGR2HSV),
-            "lab": rgb_to_lab(img),
         }
+        if compute_derived:
+            result["hsv"] = cv2.cvtColor(
+                cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2HSV
+            )
+            result["lab"] = rgb_to_lab(img)
+        return result
 
     # ----------------------------------------------------------
     # 辅助方法
@@ -354,7 +375,7 @@ class ImagePreprocessor:
 
     @staticmethod
     def _lab_to_srgb_approx(lab: np.ndarray) -> np.ndarray:
-        """Lab → sRGB 近似转换 (用于CCM计算).
+        """Convert ColorChecker Lab (D50) values to display-referred sRGB (D65).
 
         精确转换建议使用 colour-science 库.
         """
@@ -377,7 +398,12 @@ class ImagePreprocessor:
         xyz[..., 1] *= 1.00000
         xyz[..., 2] *= 0.82521
 
-        # XYZ → linear sRGB
+        # ColorChecker reference values are D50, while sRGB uses a D65 white.
+        # Apply Bradford chromatic adaptation before the D65 XYZ→sRGB matrix.
+        flat_xyz = xyz.reshape(-1, 3)
+        xyz = (BRADFORD_D50_TO_D65 @ flat_xyz.T).T.reshape(xyz.shape)
+
+        # XYZ (D65) → linear sRGB
         M = np.array([
             [3.2404542, -1.5371385, -0.4985314],
             [-0.9692660, 1.8760108, 0.0415560],
@@ -388,6 +414,8 @@ class ImagePreprocessor:
 
         # Gamma 校正
         mask = linear_rgb <= 0.0031308
-        srgb = np.where(mask, 12.92 * linear_rgb,
-                        1.055 * linear_rgb ** (1/2.4) - 0.055)
+        srgb = np.empty_like(linear_rgb)
+        srgb[mask] = 12.92 * linear_rgb[mask]
+        positive = ~mask
+        srgb[positive] = 1.055 * np.power(linear_rgb[positive], 1 / 2.4) - 0.055
         return np.clip(srgb, 0, 1)

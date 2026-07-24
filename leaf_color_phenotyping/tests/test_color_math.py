@@ -1,9 +1,13 @@
 import numpy as np
 
 from src.color_features import ColorFeatureExtractor
+from src.preprocessing import ImagePreprocessor
 from src.segmentation import IMAGENET_MEAN, IMAGENET_STD, normalize_imagenet_rgb
+from src.texture_features import ColorTextureAnalyzer, GLCMTextureExtractor
 from src.utils import (
+    COLORCHECKER_24_LAB_D50,
     delta_e_2000,
+    get_colorchecker_lab_d65,
     histogram_features,
     rgb_to_lab,
     rgb_to_ycbcr,
@@ -71,4 +75,84 @@ def test_color_extractor_respects_explicit_empty_color_spaces():
     mask = np.full((2, 2), 255, dtype=np.uint8)
 
     assert extractor.extract(image, mask) == {}
+
+
+def test_colorchecker_d50_white_adapts_to_neutral_srgb():
+    white_lab_d50 = np.array([[100.0, 0.0, 0.0]], dtype=np.float64)
+
+    srgb = ImagePreprocessor._lab_to_srgb_approx(white_lab_d50)[0]
+
+    assert np.allclose(srgb, [1.0, 1.0, 1.0], atol=2e-4)
+
+
+def test_colorchecker_d65_reference_is_actually_adapted():
+    adapted = get_colorchecker_lab_d65()
+
+    assert adapted.shape == (24, 3)
+    assert np.isfinite(adapted).all()
+    assert not np.allclose(adapted, COLORCHECKER_24_LAB_D50, atol=1e-6)
+
+
+def test_pixel_channel_ratios_ignore_near_black_denominators():
+    image = np.array([[[255, 0, 255], [100, 100, 50]]], dtype=np.uint8)
+    mask = np.full((1, 2), 255, dtype=np.uint8)
+    extractor = ColorFeatureExtractor(
+        color_spaces=["RGB"],
+        include_color_moments=False,
+        include_histogram=False,
+        include_chromaticity=False,
+    )
+
+    result = extractor.extract(image, mask)
+
+    assert result["RGB_ratio_valid_fraction"] == 0.5
+    assert np.isclose(result["RGB_B_over_G_std"], 0.0)
+    assert np.isfinite(result["RGB_B_over_G_mean"])
+
+
+def test_hue_statistics_are_circular_at_opencv_wraparound():
+    hsv = np.array([[[1, 255, 255], [179, 255, 255]]], dtype=np.uint8)
+    mask = np.ones((1, 2), dtype=np.uint8)
+    extractor = ColorFeatureExtractor(color_spaces=[])
+
+    result = extractor._extract_space_features(hsv, mask, "HSV", ["H", "S", "V"])
+
+    assert result["HSV_H_mean"] < 2 or result["HSV_H_mean"] > 178
+    assert result["HSV_H_std"] < 2
+
+
+def test_masked_glcm_ignores_pixels_outside_leaf_mask():
+    image_a = np.zeros((8, 8, 3), dtype=np.uint8)
+    image_b = np.full((8, 8, 3), 255, dtype=np.uint8)
+    leaf_pattern = np.tile(np.array([40, 80, 40, 80], dtype=np.uint8), (4, 1))
+    image_a[2:6, 2:6] = leaf_pattern[..., None]
+    image_b[2:6, 2:6] = leaf_pattern[..., None]
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 255
+    extractor = GLCMTextureExtractor(distances=[1], angles=[0], levels=16)
+
+    result_a = extractor.compute(image_a, mask)
+    result_b = extractor.compute(image_b, mask)
+
+    assert result_a == result_b
+
+
+def test_signed_lab_uniformity_cv_is_non_negative():
+    lab = np.array([[[-20.0, -2.0, 3.0], [-10.0, -4.0, 5.0]]], dtype=np.float32)
+    mask = np.full((1, 2), 255, dtype=np.uint8)
+
+    result = ColorTextureAnalyzer.color_uniformity(lab, mask)
+
+    assert result["Uniformity_CV_a"] >= 0
+    assert result["Uniformity_CV_b"] >= 0
+
+
+def test_feature_names_have_no_case_insensitive_collisions():
+    image = np.full((4, 4, 3), [0.2, 0.6, 0.1], dtype=np.float32)
+    mask = np.full((4, 4), 255, dtype=np.uint8)
+
+    result = ColorFeatureExtractor().extract(image, mask)
+    normalized_names = [name.casefold() for name in result]
+
+    assert len(normalized_names) == len(set(normalized_names))
 

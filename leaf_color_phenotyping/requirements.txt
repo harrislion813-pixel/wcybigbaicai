@@ -2,38 +2,15 @@
 # 大白菜叶色表型提取 — 依赖列表
 # ============================================================
 
-# 核心图像处理
+# 核心批处理
 numpy>=1.24.0
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 scikit-image>=0.21.0
-Pillow>=10.0.0
 
-# 颜色科学 (可选, 用于精确颜色校正)
-colour-science>=0.4.0
-
-# RAW文件读取 (可选, 仅RAW输入时需要)
+# RAW 文件读取
 rawpy>=0.17.0
 
 # 数据处理
 pandas>=2.0.0
 PyYAML>=6.0
 openpyxl>=3.1.0
-
-# 深度学习 (可选, 仅使用U-Net/SAM分割时需要)
-torch>=2.0.0
-torchvision>=0.15.0
-segmentation-models-pytorch>=0.3.0
-
-# 数据增强 (可选, 训练分割模型时需要)
-albumentations>=1.3.0
-
-# SAM (可选, 零样本分割)
-# git+https://github.com/facebookresearch/segment-anything.git
-
-# 可视化与报告 (可选)
-matplotlib>=3.7.0
-seaborn>=0.12.0
-
-# 开发工具
-ipython>=8.0.0
-jupyter>=1.0.0
