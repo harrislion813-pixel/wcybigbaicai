@@ -20,6 +20,10 @@ import pandas as pd
 from src.pipeline import LeafColorPipeline
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="大白菜叶色表型批量提取工具",
@@ -39,8 +43,10 @@ def parse_args():
   python batch_extract.py --input ./data/raw/ --no-aggregate
         """
     )
-    parser.add_argument("--config", "-c", type=str, default=None,
-                        help="YAML配置文件路径")
+    parser.add_argument(
+        "--config", "-c", type=str, default=str(DEFAULT_CONFIG_PATH),
+        help=f"YAML配置文件路径（默认: {DEFAULT_CONFIG_PATH}）",
+    )
     parser.add_argument("--input", "-i", type=str, default=None,
                         help="输入图像目录")
     parser.add_argument("--output", "-o", type=str, default=None,

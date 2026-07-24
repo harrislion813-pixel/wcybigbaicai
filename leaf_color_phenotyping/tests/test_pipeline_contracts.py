@@ -1,6 +1,7 @@
 import json
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -203,6 +204,7 @@ def test_cli_override_defaults_are_none(monkeypatch):
 
     args = batch_extract.parse_args()
 
+    assert Path(args.config) == batch_extract.DEFAULT_CONFIG_PATH
     assert args.method is None
     assert args.device is None
     assert args.white_balance is None
