@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QUrl, Signal, Qt
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QThread, QTimer, QUrl, Signal, Qt
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QFileDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
@@ -28,6 +28,10 @@ def _short_error(traceback_text: str) -> str:
     return lines[-1] if lines else "未知错误"
 
 
+def _window_is_closing(widget: QWidget) -> bool:
+    return bool(getattr(widget.window(), "_closing_when_idle", False))
+
+
 class ThreadHost:
     def _init_thread_host(self) -> None:
         self._jobs: list[tuple[QThread, object]] = []
@@ -41,16 +45,35 @@ class ThreadHost:
             worker.failed.connect(on_failure)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         job = (thread, worker)
         self._jobs.append(job)
 
         def cleanup() -> None:
-            if job in self._jobs:
-                self._jobs.remove(job)
+            self._jobs = [existing for existing in self._jobs if existing is not job]
 
         thread.finished.connect(cleanup)
+        thread.finished.connect(thread.deleteLater)
         thread.start()
+
+    def _request_job_cancellation(self) -> None:
+        for thread, worker in tuple(self._jobs):
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+            thread.requestInterruption()
+
+    def _has_active_jobs(self) -> bool:
+        active_jobs = []
+        for job in self._jobs:
+            try:
+                if job[0].isRunning():
+                    active_jobs.append(job)
+            except RuntimeError:
+                # Qt may process deleteLater before a queued Python callback
+                # during application shutdown. A deleted QThread is not active.
+                continue
+        self._jobs = active_jobs
+        return bool(active_jobs)
 
 
 class AnalysisPage(QWidget, ThreadHost):
@@ -330,13 +353,19 @@ class AnalysisPage(QWidget, ThreadHost):
         self.log.append(
             f"{state}：{len(dataframe)} 行结果，{len(result.failures)} 张图片失败。"
         )
-        QMessageBox.information(self, state, f"结果位置：\n{result.table_path}")
+        if not _window_is_closing(self):
+            if result.table_path.is_file():
+                message = f"结果位置：\n{result.table_path}"
+            else:
+                message = "任务在生成任何结果前已取消。"
+            QMessageBox.information(self, state, message)
 
     def _task_failed(self, details: str) -> None:
         self.active_worker = None
         self._set_busy(False)
         self.log.append(details)
-        QMessageBox.critical(self, "任务失败", _short_error(details))
+        if not _window_is_closing(self):
+            QMessageBox.critical(self, "任务失败", _short_error(details))
 
     def _open_output(self) -> None:
         path = self.output_path.path()
@@ -486,12 +515,14 @@ class CalibrationPage(QWidget, ThreadHost):
         lines.extend(result.warnings)
         self.result.setText("\n".join(lines))
         self.profile_created.emit(str(result.profile_path))
-        QMessageBox.information(self, "颜色校准完成", status_text)
+        if not _window_is_closing(self):
+            QMessageBox.information(self, "颜色校准完成", status_text)
 
     def _failed(self, details: str) -> None:
         self.create_button.setEnabled(True)
         self.result.setText(details)
-        QMessageBox.critical(self, "颜色校准失败", _short_error(details))
+        if not _window_is_closing(self):
+            QMessageBox.critical(self, "颜色校准失败", _short_error(details))
 
 
 class ProfilePage(QWidget):
@@ -528,6 +559,8 @@ class ProfilePage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, project_dir: Path | None = None):
         super().__init__()
+        self._closing_when_idle = False
+        self._force_close = False
         self.project_dir = Path(project_dir or Path(__file__).resolve().parent.parent)
         self.setWindowTitle("大白菜叶色表型分析")
         self.resize(1420, 900)
@@ -554,3 +587,44 @@ class MainWindow(QMainWindow):
         self.profile_page.registry.add_directory(Path(profile_path).parent)
         self.analysis_page.refresh_profiles()
         self.profile_page.refresh()
+
+    def _thread_hosts(self) -> tuple[ThreadHost, ...]:
+        return self.analysis_page, self.calibration_page
+
+    def _has_active_jobs(self) -> bool:
+        return any(host._has_active_jobs() for host in self._thread_hosts())
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._force_close or not self._has_active_jobs():
+            event.accept()
+            return
+        if self._closing_when_idle:
+            event.ignore()
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "任务仍在运行",
+            "当前任务尚未结束。是否请求取消并在任务安全停止后退出？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
+        self._closing_when_idle = True
+        self.setEnabled(False)
+        for host in self._thread_hosts():
+            host._request_job_cancellation()
+            for thread, _ in tuple(host._jobs):
+                thread.finished.connect(self._finish_deferred_close)
+        event.ignore()
+        QTimer.singleShot(0, self._finish_deferred_close)
+
+    def _finish_deferred_close(self) -> None:
+        if self._has_active_jobs():
+            return
+        self._force_close = True
+        self.setEnabled(True)
+        QTimer.singleShot(0, self.close)

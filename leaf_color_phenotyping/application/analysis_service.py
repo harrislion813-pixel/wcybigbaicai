@@ -24,6 +24,14 @@ class AnalysisService:
     def build_config(self, request: AnalysisRequest) -> Dict[str, Any]:
         if not request.input_dir.is_dir():
             raise FileNotFoundError(f"图片文件夹不存在: {request.input_dir}")
+        input_root = request.input_dir.resolve()
+        output_root = request.output_dir.resolve()
+        try:
+            output_root.relative_to(input_root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("结果文件夹不能位于图片文件夹内部，请选择独立目录")
         request.output_dir.mkdir(parents=True, exist_ok=True)
         with self.config_path.open("r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
@@ -155,4 +163,3 @@ class AnalysisService:
             failures=tuple(pipeline.last_batch_failures),
             cancelled=pipeline.last_batch_cancelled,
         )
-

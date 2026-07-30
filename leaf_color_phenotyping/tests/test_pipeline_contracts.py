@@ -522,6 +522,67 @@ def test_all_batch_failures_are_written_to_a_report(tmp_path, monkeypatch):
     assert "synthetic failure" in failure_path.read_text(encoding="utf-8")
 
 
+def test_clean_rerun_removes_stale_failure_report(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    image = np.full((32, 32, 3), 255, dtype=np.uint8)
+    image[8:24, 8:24] = [30, 160, 30]
+    write_image_rgb(image_dir / "leaf.png", image)
+    broken = image_dir / "broken.png"
+    broken.write_bytes(b"not an image")
+    output_path = tmp_path / "phenotypes.csv"
+    config = {
+        "segmentation": {"method": "exg", "min_leaf_area_ratio": 0.01},
+        "features": {"texture": {"enabled": False}},
+    }
+
+    first = LeafColorPipeline(config)
+    first.process_batch(
+        str(image_dir), output_csv=str(output_path),
+        group_by_sample=False, verbose=False,
+    )
+    failure_path = tmp_path / "phenotypes_failures.csv"
+    assert failure_path.is_file()
+
+    broken.unlink()
+    second = LeafColorPipeline(config)
+    second.process_batch(
+        str(image_dir), output_csv=str(output_path),
+        group_by_sample=False, verbose=False,
+    )
+
+    assert second.last_batch_failures == []
+    assert not failure_path.exists()
+
+
+def test_nonaggregated_rerun_removes_stale_raw_table(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    image = np.full((32, 32, 3), 255, dtype=np.uint8)
+    image[8:24, 8:24] = [30, 160, 30]
+    write_image_rgb(image_dir / "leaf_rep1.png", image)
+    write_image_rgb(image_dir / "leaf_rep2.png", image)
+    output_path = tmp_path / "phenotypes.csv"
+    config = {
+        "segmentation": {"method": "exg", "min_leaf_area_ratio": 0.01},
+        "features": {"texture": {"enabled": False}},
+    }
+
+    LeafColorPipeline(config).process_batch(
+        str(image_dir), output_csv=str(output_path),
+        group_by_sample=True, verbose=False,
+    )
+    raw_path = tmp_path / "phenotypes_raw.csv"
+    assert raw_path.is_file()
+
+    LeafColorPipeline(config).process_batch(
+        str(image_dir), output_csv=str(output_path),
+        group_by_sample=False, verbose=False,
+    )
+
+    assert not raw_path.exists()
+
+
 def test_sixteen_bit_standard_image_preserves_dynamic_range(tmp_path):
     image = np.array([[[0, 32768, 65535]]], dtype=np.uint16)
     bgr = image[..., ::-1]
@@ -627,6 +688,30 @@ def test_batch_writes_both_recursive_visualizations_with_duplicate_stems(tmp_pat
     assert len(result) == 2
     assert (vis_root / "batch-a" / "leaf__png_vis.png").exists()
     assert (vis_root / "batch-b" / "leaf__png_vis.png").exists()
+
+
+def test_batch_does_not_reingest_visualizations_inside_input_tree(tmp_path):
+    image_root = tmp_path / "images"
+    image = np.full((32, 32, 3), 255, dtype=np.uint8)
+    image[8:24, 8:24] = [30, 160, 30]
+    write_image_rgb(image_root / "leaf.png", image)
+    output_path = image_root / "phenotypes.csv"
+    config = {
+        "segmentation": {"method": "exg", "min_leaf_area_ratio": 0.01},
+        "features": {"texture": {"enabled": False}},
+    }
+
+    LeafColorPipeline(config).process_batch(
+        str(image_root), output_csv=str(output_path),
+        group_by_sample=False, save_visualizations=True, verbose=False,
+    )
+    result = LeafColorPipeline(config).process_batch(
+        str(image_root), output_csv=str(output_path),
+        group_by_sample=False, save_visualizations=True, verbose=False,
+    )
+
+    assert len(result) == 1
+    assert Path(result.iloc[0]["image_path"]).name == "leaf.png"
 
 
 def test_aggregate_rejects_conflicting_metadata_within_sample():

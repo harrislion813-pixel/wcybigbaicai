@@ -141,6 +141,17 @@ def test_hue_statistics_are_circular_at_opencv_wraparound():
     assert result["HSV_H_std"] < 2
 
 
+def test_cielab_hab_circular_standard_deviation_is_reported_in_degrees():
+    lab = np.array([[[50, 10, 0], [50, 0, 10]]], dtype=np.float32)
+    mask = np.ones((1, 2), dtype=np.uint8)
+
+    result = ColorFeatureExtractor()._extract_lab_advanced(lab, mask)
+    resultant = np.hypot(0.5, 0.5)
+    expected_degrees = np.sqrt(-2 * np.log(resultant)) * 180 / np.pi
+
+    assert np.isclose(result["CIELAB_hab_std"], expected_degrees)
+
+
 def test_masked_glcm_ignores_pixels_outside_leaf_mask():
     image_a = np.zeros((8, 8, 3), dtype=np.uint8)
     image_b = np.full((8, 8, 3), 255, dtype=np.uint8)

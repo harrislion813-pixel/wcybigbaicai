@@ -137,6 +137,30 @@ def _validate_samples(samples: np.ndarray, label: str) -> np.ndarray:
     return rgb
 
 
+def _validate_independent_patch_samples(
+    training_rgb: np.ndarray,
+    validation_rgb: np.ndarray,
+) -> Dict[str, float]:
+    """Reject duplicated validation samples and report their separation.
+
+    Different source files are necessary but not sufficient evidence of an
+    independent capture: an image can be re-encoded, renamed, or changed only
+    outside the sampled chart.  Comparing the actual 24-patch measurements
+    closes that loophole while retaining a quantitative audit value.
+    """
+    absolute_difference = np.abs(training_rgb - validation_rgb)
+    metrics = {
+        "mean_absolute_rgb_difference": float(np.mean(absolute_difference)),
+        "max_absolute_rgb_difference": float(np.max(absolute_difference)),
+    }
+    if np.allclose(training_rgb, validation_rgb, rtol=0.0, atol=1e-6):
+        raise ValueError(
+            "Training and validation patch measurements are identical or "
+            "nearly identical; use a genuinely independent capture"
+        )
+    return metrics
+
+
 def _fit_candidates(
     training_rgb: np.ndarray,
     validation_rgb: np.ndarray,
@@ -245,6 +269,9 @@ def fit_calibration_profile(request: CalibrationProfileRequest) -> CalibrationPr
     validation_sha = sha256_file(validation_path)
     if training_path == validation_path or training_sha == validation_sha:
         raise ValueError("Training and validation captures must be independent")
+    independence_metrics = _validate_independent_patch_samples(
+        training_rgb, validation_rgb
+    )
 
     target_xyz = lab_d50_to_xyz_d65(
         get_colorchecker_reference_lab(request.reference_id)
@@ -254,6 +281,7 @@ def fit_calibration_profile(request: CalibrationProfileRequest) -> CalibrationPr
     )
     quality = _quality_report(fit, validation_rgb, target_xyz, request.gates)
     quality["candidate_validation_delta_e00"] = candidates
+    quality["capture_independence"] = independence_metrics
     reference_srgb, _ = xyz_d65_to_srgb(target_xyz)
     quality["reference_display_out_of_gamut_fraction"] = float(np.mean(
         np.any((reference_srgb < 0) | (reference_srgb > 1), axis=1)

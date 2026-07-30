@@ -412,6 +412,45 @@ def test_linear_xyz_profile_preserves_segmentation_and_marks_qc(tmp_path):
     assert calibrated_pipeline.color_calibration_applied
 
 
+def test_linear_xyz_profile_preserves_empty_mask_qc_row(tmp_path):
+    image_path = tmp_path / "blank.png"
+    write_image_rgb(image_path, np.zeros((32, 32, 3), dtype=np.float32))
+    write_calibration_profile(
+        make_profile(
+            matrix=np.eye(3).tolist(),
+            input_domain="linear_srgb",
+            target_space="XYZ",
+        ),
+        tmp_path / "linear.ccm.json",
+    )
+    pipeline = LeafColorPipeline({
+        "_config_dir": str(tmp_path),
+        "imaging": {"camera_id": "test-camera"},
+        "color_calibration": {
+            "mode": "required",
+            "profile_file": "linear.ccm.json",
+        },
+        "segmentation": {
+            "method": "exg",
+            "exclude_white_tissue": False,
+        },
+        "features": {
+            "vegetation_indices": {"enabled": False},
+            "texture": {"enabled": False},
+            "shape": {"enabled": False},
+        },
+    })
+    pipeline.segmenter.segment = lambda image: np.zeros(
+        image.shape[:2], dtype=np.uint8
+    )
+
+    result = pipeline.process_single(str(image_path), verbose=False)
+
+    assert result["features"]["QC_mask_is_empty"] == 1.0
+    assert result["features"]["QC_CCM_applied"] == 1.0
+    assert np.isnan(result["features"]["QC_CCM_clipped_fraction"])
+
+
 def _write_patch_csv(path, rgb, *, scale=65535, decimals=8):
     lines = ["patch_id,R,G,B"]
     for patch_id, values in zip(COLORCHECKER_24_PATCH_IDS, rgb * scale):
@@ -470,10 +509,12 @@ def test_calibration_cli_fit_creates_validated_xyz_profile(tmp_path):
         get_colorchecker_reference_lab("after_nov_2014")
     )
     measured = target_xyz / 1.2
+    validation_measured = measured.copy()
+    validation_measured[:, 0] *= 1.00002
     training_csv = tmp_path / "training.csv"
     validation_csv = tmp_path / "validation.csv"
     _write_patch_csv(training_csv, measured, decimals=8)
-    _write_patch_csv(validation_csv, measured, decimals=10)
+    _write_patch_csv(validation_csv, validation_measured, decimals=10)
     output = tmp_path / "synthetic.ccm.json"
 
     return_code = calibration_main([
@@ -498,7 +539,7 @@ def test_calibration_cli_fit_creates_validated_xyz_profile(tmp_path):
     assert profile.status == "validated"
     assert profile.data["target"]["space"] == "XYZ"
     assert np.allclose(profile.matrix, np.eye(3) * 1.2, atol=1e-6)
-    assert profile.data["quality"]["validation_delta_e00"]["max"] < 1e-4
+    assert profile.data["quality"]["validation_delta_e00"]["max"] < 0.01
     assert calibration_main([
         "validate",
         "--profile", str(output),

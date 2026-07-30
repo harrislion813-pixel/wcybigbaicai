@@ -274,7 +274,7 @@ class ColorFeatureExtractor:
         resultant = float(np.hypot(sin_mean, cos_mean))
         feats["CIELAB_hab_std"] = float(
             np.sqrt(max(0.0, -2.0 * np.log(max(resultant, 1e-12))))
-            * 180.0 / (2 * np.pi)
+            * 180.0 / np.pi
         )
         feats["CIELAB_hab_circular_variance"] = 1.0 - resultant
 

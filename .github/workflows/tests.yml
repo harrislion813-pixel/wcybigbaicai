@@ -35,3 +35,8 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+      - name: Smoke-test desktop application
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python app.py --smoke-test

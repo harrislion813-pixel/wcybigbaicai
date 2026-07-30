@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from application.analysis_service import AnalysisService
 from application.calibration_service import CalibrationService
@@ -84,7 +85,8 @@ def test_image_workflow_can_create_a_validated_profile(tmp_path):
         get_colorchecker_reference_lab("after_nov_2014")
     )
     training = target_xyz.copy()
-    validation = np.clip(target_xyz + 1e-7, 0, 1)
+    perturbation = np.linspace(-2e-4, 2e-4, target_xyz.size).reshape(target_xyz.shape)
+    validation = np.clip(target_xyz + perturbation, 0, 1)
 
     result = fit_calibration_profile(CalibrationProfileRequest(
         training_rgb=training,
@@ -105,6 +107,29 @@ def test_image_workflow_can_create_a_validated_profile(tmp_path):
     assert summaries[0].selectable
 
 
+def test_image_workflow_rejects_duplicated_validation_patches(tmp_path):
+    training_source = tmp_path / "training.png"
+    validation_source = tmp_path / "validation.png"
+    training_source.write_bytes(b"training-container")
+    validation_source.write_bytes(b"different-container")
+    patches = lab_d50_to_xyz_d65(
+        get_colorchecker_reference_lab("after_nov_2014")
+    )
+
+    with pytest.raises(ValueError, match="patch measurements.*independent capture"):
+        fit_calibration_profile(CalibrationProfileRequest(
+            training_rgb=patches,
+            validation_rgb=patches.copy(),
+            training_source=training_source,
+            validation_source=validation_source,
+            output_path=tmp_path / "profile.ccm.json",
+            profile_id="duplicate-validation",
+            camera_id="test-camera",
+            input_kind="rendered_rgb",
+            reference_id="after_nov_2014",
+        ))
+
+
 def test_analysis_service_hides_ccm_for_relative_runs(tmp_path):
     image_dir = tmp_path / "images"
     image_dir.mkdir()
@@ -121,6 +146,18 @@ def test_analysis_service_hides_ccm_for_relative_runs(tmp_path):
     assert config["color_calibration"]["mode"] == "off"
     assert config["color_calibration"]["profile_file"] == ""
     assert config["segmentation"]["method"] == "auto"
+
+
+def test_analysis_service_rejects_output_inside_input_tree(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    service = AnalysisService(Path(__file__).resolve().parent.parent)
+
+    with pytest.raises(ValueError, match="结果文件夹不能位于图片文件夹内部"):
+        service.build_config(AnalysisRequest(
+            input_dir=image_dir,
+            output_dir=image_dir / "results",
+        ))
 
 
 def test_analysis_service_runs_without_cli_arguments(tmp_path):
@@ -160,8 +197,7 @@ def test_calibration_service_builds_profile_directly_from_two_images(tmp_path):
     training_path = tmp_path / "training.png"
     validation_path = tmp_path / "validation.png"
     write_image_rgb(training_path, chart)
-    validation_chart = chart.copy()
-    validation_chart[0, 0] = 0
+    validation_chart = np.clip(chart * 0.995 + 0.0005, 0, 1)
     write_image_rgb(validation_path, validation_chart)
     corners = full_image_corners(chart)
 

@@ -422,7 +422,7 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 |---|---|---|
 | `image_dir` | `./data/raw_images/` | 输入图片根目录；批处理会递归搜索 |
 | `colorchecker_dir` | `./data/colorchecker/` | 色卡参考图目录；当前批处理不会自动从这里计算 CCM |
-| `output_dir` | `./output/` | 未通过 `--output` 指定文件时使用 |
+| `output_dir` | `./output/` | 未通过 `--output` 指定文件时使用；桌面版要求结果目录位于图片目录之外 |
 | `model_dir` | `./models/` | 模型目录记录项；实际模型路径由 `segmentation.unet_model` 或命令行指定 |
 
 配置中的相对路径以配置文件所在目录为基准。
@@ -1022,7 +1022,7 @@ segmentation:
 
 ### 10.1 CCM 怎样获得
 
-1. 固定相机、镜头、光源、曝光和白平衡，拍摄一张训练色卡和另一张独立验证色卡。
+1. 固定相机、镜头、光源、曝光和白平衡，拍摄一张训练色卡和另一张真正独立的验证色卡。程序会拒绝相同或近乎相同的 24 色块采样，重命名或重新编码同一次拍摄不能作为验证。
 2. 按标准顺序提取 24 个色块均值，保存为两个 CSV。列必须精确为 `patch_id,R,G,B`，patch ID 可在 `src.utils.COLORCHECKER_24_PATCH_IDS` 中查看。
 3. 确认色卡生产版本：`before_nov_2014` 或 `after_nov_2014`。两个版本色料与参考值不同，不允许使用模糊的“ColorChecker Classic”默认值。
 4. 明确 CSV 数值尺度是 `1`、`255` 还是 `65535`，明确值属于 `linear_srgb` 还是 RAW 的 `camera_linear_rgb`。工具不会猜测或自动纠正错误尺度。

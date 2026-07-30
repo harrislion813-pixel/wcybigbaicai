@@ -643,16 +643,32 @@ class LeafColorPipeline:
             and self.color_calibration_applied
             and profile.data["target"]["space"] == "XYZ"
         ):
-            application = apply_calibration_profile(
-                profile, feature_views["rgb"], mask=feature_mask
-            )
-            feature_views["rgb"] = application.srgb
-            feature_views["rgb_uint8"] = (
-                application.srgb * 255
-            ).clip(0, 255).astype(np.uint8)
-            feature_lab = application.lab_d65
-            calibration_qc.update(application.qc)
             calibration_qc["QC_CCM_applied"] = 1.0
+            if np.any(feature_mask):
+                application = apply_calibration_profile(
+                    profile, feature_views["rgb"], mask=feature_mask
+                )
+                feature_views["rgb"] = application.srgb
+                feature_views["rgb_uint8"] = (
+                    application.srgb * 255
+                ).clip(0, 255).astype(np.uint8)
+                feature_lab = application.lab_d65
+                calibration_qc.update(application.qc)
+            else:
+                # Preserve the QC row when segmentation finds no leaf.  There
+                # are no selected pixels on which clipping can be measured.
+                feature_views["rgb_uint8"] = (
+                    feature_views["rgb"] * 255
+                ).clip(0, 255).astype(np.uint8)
+                feature_lab = rgb_to_lab(feature_views["rgb"])
+                for key in (
+                    "QC_CCM_negative_fraction",
+                    "QC_CCM_clipped_fraction",
+                    "QC_CCM_R_clipped_fraction",
+                    "QC_CCM_G_clipped_fraction",
+                    "QC_CCM_B_clipped_fraction",
+                ):
+                    calibration_qc[key] = np.nan
         elif self.preprocessor.has_color_correction_matrix:
             feature_views["rgb"] = self.preprocessor.apply_color_correction(
                 feature_views["rgb"]
@@ -792,9 +808,32 @@ class LeafColorPipeline:
         Returns:
             DataFrame: 表型表
         """
-        img_paths = find_images(image_dir)
         if save_visualizations is None:
             save_visualizations = self.default_save_visualizations
+        image_root = Path(image_dir).resolve()
+        if visualization_dir:
+            configured_vis_dir = Path(visualization_dir)
+        elif output_csv:
+            configured_vis_dir = Path(output_csv).parent / "visualizations"
+        else:
+            configured_vis_dir = Path(output_dir or ".") / "visualizations"
+        resolved_vis_dir = configured_vis_dir.resolve()
+        if save_visualizations and resolved_vis_dir == image_root:
+            raise ValueError("visualization directory cannot be the input image directory")
+
+        img_paths = find_images(image_dir)
+        if resolved_vis_dir != image_root:
+            try:
+                resolved_vis_dir.relative_to(image_root)
+            except ValueError:
+                pass
+            else:
+                # A previous run may have written PNG previews below the input
+                # tree. Never treat those managed outputs as source captures.
+                img_paths = [
+                    path for path in img_paths
+                    if resolved_vis_dir not in path.resolve().parents
+                ]
         self.last_batch_failures = []
         self.last_batch_cancelled = False
         if verbose:
@@ -823,15 +862,15 @@ class LeafColorPipeline:
             return pd.DataFrame()
 
         vis_dir = None
-        image_root = Path(image_dir).resolve()
         if save_visualizations:
-            if visualization_dir:
-                vis_dir = Path(visualization_dir)
-            elif output_csv:
-                vis_dir = Path(output_csv).parent / "visualizations"
-            else:
-                vis_dir = Path(output_dir or ".") / "visualizations"
+            vis_dir = configured_vis_dir
             safe_mkdir(vis_dir)
+
+        requested_output_path = None
+        if output_csv or output_dir:
+            requested_output_path, _ = self._resolve_table_path(
+                output_csv or str(Path(output_dir or ".") / self.output_table_name)
+            )
 
         # 逐张处理
         records = []
@@ -874,17 +913,24 @@ class LeafColorPipeline:
                 continue
 
         if not records:
-            if (self.last_batch_failures or self.last_batch_cancelled) and (output_csv or output_dir):
-                base_path = Path(output_csv or str(
-                    Path(output_dir or ".") / self.output_table_name
-                ))
-                if not base_path.suffix:
-                    base_path = base_path.with_suffix(".csv")
+            if (
+                (self.last_batch_failures or self.last_batch_cancelled)
+                and requested_output_path is not None
+            ):
+                base_path = requested_output_path
+                base_path.unlink(missing_ok=True)
+                base_path.with_name(
+                    f"{base_path.stem}_raw{base_path.suffix}"
+                ).unlink(missing_ok=True)
+                failure_path = base_path.with_name(
+                    f"{base_path.stem}_failures.csv"
+                )
                 if self.last_batch_failures:
-                    failure_path = base_path.with_name(f"{base_path.stem}_failures.csv")
                     safe_mkdir(failure_path.parent)
                     pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
                     print(f"Failure report saved to: {failure_path}")
+                else:
+                    failure_path.unlink(missing_ok=True)
                 if self.write_manifest:
                     self._save_run_manifest(
                         output_path=base_path,
@@ -893,6 +939,10 @@ class LeafColorPipeline:
                         successful_images=0,
                         output_samples=0,
                     )
+                else:
+                    base_path.with_name(
+                        f"{base_path.stem}_manifest.json"
+                    ).unlink(missing_ok=True)
             return pd.DataFrame()
 
         # 构建DataFrame
@@ -921,22 +971,25 @@ class LeafColorPipeline:
             )
 
         # 保存
-        if output_csv or output_dir:
-            output_path = output_csv or str(
-                Path(output_dir or ".") / self.output_table_name
+        if requested_output_path is not None:
+            output_path = self._save_table(df, str(requested_output_path))
+            raw_path = output_path.with_name(
+                f"{output_path.stem}_raw{output_path.suffix}"
             )
-            output_path = self._save_table(df, output_path)
             if group_by_sample and self.save_raw_table:
-                raw_path = output_path.with_name(
-                    f"{output_path.stem}_raw{output_path.suffix}"
-                )
                 self._save_table(raw_df, str(raw_path))
                 if verbose:
                     print(f"  Per-image table saved to: {raw_path}")
+            else:
+                raw_path.unlink(missing_ok=True)
+            failure_path = output_path.with_name(
+                f"{output_path.stem}_failures.csv"
+            )
             if self.last_batch_failures:
-                failure_path = output_path.with_name(f"{output_path.stem}_failures.csv")
                 pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
                 print(f"  Failure report saved to: {failure_path}")
+            else:
+                failure_path.unlink(missing_ok=True)
             if self.write_manifest:
                 manifest_path = self._save_run_manifest(
                     output_path=output_path,
@@ -947,6 +1000,10 @@ class LeafColorPipeline:
                 )
                 if verbose:
                     print(f"  Run manifest saved to: {manifest_path}")
+            else:
+                output_path.with_name(
+                    f"{output_path.stem}_manifest.json"
+                ).unlink(missing_ok=True)
             print(f"\nPhenotype table saved to: {output_path}")
             print(f"  Shape: {df.shape[0]} samples × {df.shape[1]} traits")
 
@@ -1342,8 +1399,8 @@ class LeafColorPipeline:
 
         return grouped.reset_index()
 
-    def _save_table(self, df: pd.DataFrame, output_path: str) -> Path:
-        """Save a phenotype table using the configured or explicit file format."""
+    def _resolve_table_path(self, output_path: str) -> tuple[Path, str]:
+        """Resolve the final table path and format without writing it."""
         path = Path(output_path)
         suffix_to_format = {
             ".csv": "csv",
@@ -1358,6 +1415,11 @@ class LeafColorPipeline:
         if not path.suffix:
             extension = {"csv": ".csv", "excel": ".xlsx", "json": ".json"}[output_format]
             path = path.with_suffix(extension)
+        return path, output_format
+
+    def _save_table(self, df: pd.DataFrame, output_path: str) -> Path:
+        """Save a phenotype table using the configured or explicit file format."""
+        path, output_format = self._resolve_table_path(output_path)
 
         safe_mkdir(path.parent)
         if output_format == "csv":

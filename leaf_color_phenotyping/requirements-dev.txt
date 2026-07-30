@@ -1,2 +1,2 @@
--r requirements.txt
+-r requirements-gui.txt
 pytest>=8.0.0
