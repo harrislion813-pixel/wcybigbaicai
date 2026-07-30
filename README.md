@@ -2,9 +2,18 @@
 
 项目代码和完整使用手册位于 `leaf_color_phenotyping` 目录。
 
-## 第一次使用
+## 第一次使用（推荐桌面版）
 
-请从这份文档开始：
+进入 `leaf_color_phenotyping` 文件夹后：
+
+1. 双击 `安装桌面版依赖.bat`，完成首次安装。
+2. 双击 `启动桌面版.bat`。
+3. 在“叶片分析”中选择图片和结果文件夹，先预检，再开始分析。
+
+CCM 颜色校准已经改为图形化向导：导入两张独立拍摄的 ColorChecker 24
+色卡图即可自动检测、取样、拟合和验证，不需要手工制作 RGB CSV。
+
+详细说明见 [桌面版使用指南](leaf_color_phenotyping/GUI_GUIDE.md)。
 
 ## [完整中文操作手册](leaf_color_phenotyping/README.md)
 
@@ -17,7 +26,9 @@
 - Python 公共函数、类、参数和返回值；
 - U-Net 训练、颜色校准、输出字段和常见问题。
 
-## Windows 最短运行流程
+## 命令行模式
+
+命令行入口继续保留给开发、自动化和高级参数控制：
 
 ```powershell
 cd leaf_color_phenotyping

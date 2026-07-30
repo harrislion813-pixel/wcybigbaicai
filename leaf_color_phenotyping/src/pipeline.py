@@ -15,7 +15,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import cv2
@@ -132,6 +132,7 @@ class LeafColorPipeline:
         self.aggregate_cv = output.get("aggregate_cv", False)
         self.write_manifest = output.get("write_manifest", True)
         self.last_batch_failures: List[Dict[str, str]] = []
+        self.last_batch_cancelled = False
 
     @staticmethod
     def _validate_config(config: Dict) -> None:
@@ -771,7 +772,10 @@ class LeafColorPipeline:
                       gray_roi: Optional[np.ndarray] = None,
                       save_visualizations: Optional[bool] = None,
                       visualization_dir: Optional[str] = None,
-                      verbose: bool = True) -> pd.DataFrame:
+                      verbose: bool = True,
+                      progress_callback: Optional[Callable[[Dict[str, object]], None]] = None,
+                      cancel_check: Optional[Callable[[], bool]] = None,
+                      ) -> pd.DataFrame:
         """批量处理目录下的所有图像.
 
         Args:
@@ -782,6 +786,8 @@ class LeafColorPipeline:
             group_by_sample: 是否按样本ID汇总多张图像
             white_balance: 白平衡方法
             verbose: 是否打印进度
+            progress_callback: 每张图开始、成功或失败时接收进度字典
+            cancel_check: 返回 True 时在下一张图开始前安全停止
 
         Returns:
             DataFrame: 表型表
@@ -790,8 +796,27 @@ class LeafColorPipeline:
         if save_visualizations is None:
             save_visualizations = self.default_save_visualizations
         self.last_batch_failures = []
+        self.last_batch_cancelled = False
         if verbose:
             print(f"Found {len(img_paths)} images in {image_dir}")
+
+        def emit_progress(status: str, index: int, path: Optional[Path], message: str) -> None:
+            if progress_callback is None:
+                return
+            event: Dict[str, object] = {
+                "status": status,
+                "current": index,
+                "total": len(img_paths),
+                "image_path": str(path) if path is not None else "",
+                "message": message,
+                "successful": len(records),
+                "failed": len(self.last_batch_failures),
+            }
+            try:
+                progress_callback(event)
+            except Exception as exc:
+                if verbose:
+                    print(f"  WARNING: progress callback failed: {exc}")
 
         if not img_paths:
             print("WARNING: No images found!")
@@ -811,8 +836,13 @@ class LeafColorPipeline:
         # 逐张处理
         records = []
         for i, img_path in enumerate(img_paths):
+            if cancel_check is not None and cancel_check():
+                self.last_batch_cancelled = True
+                emit_progress("cancelled", i, img_path, "用户已取消，正在保存已完成结果")
+                break
             if verbose:
                 print(f"[{i+1}/{len(img_paths)}] Processing {img_path.name}...")
+            emit_progress("processing", i + 1, img_path, f"正在处理 {img_path.name}")
 
             try:
                 sid = parse_sample_id(img_path.name, id_pattern) if id_pattern else None
@@ -832,6 +862,7 @@ class LeafColorPipeline:
                     result.pop("visualization", None)
                     result.pop("mask", None)
                 records.append(result)
+                emit_progress("success", i + 1, img_path, f"已完成 {img_path.name}")
             except Exception as e:
                 print(f"  ERROR processing {img_path.name}: {e}")
                 self.last_batch_failures.append({
@@ -839,19 +870,21 @@ class LeafColorPipeline:
                     "error_type": type(e).__name__,
                     "error": str(e),
                 })
+                emit_progress("failed", i + 1, img_path, str(e))
                 continue
 
         if not records:
-            if self.last_batch_failures and (output_csv or output_dir):
+            if (self.last_batch_failures or self.last_batch_cancelled) and (output_csv or output_dir):
                 base_path = Path(output_csv or str(
                     Path(output_dir or ".") / self.output_table_name
                 ))
                 if not base_path.suffix:
                     base_path = base_path.with_suffix(".csv")
-                failure_path = base_path.with_name(f"{base_path.stem}_failures.csv")
-                safe_mkdir(failure_path.parent)
-                pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
-                print(f"Failure report saved to: {failure_path}")
+                if self.last_batch_failures:
+                    failure_path = base_path.with_name(f"{base_path.stem}_failures.csv")
+                    safe_mkdir(failure_path.parent)
+                    pd.DataFrame(self.last_batch_failures).to_csv(failure_path, index=False)
+                    print(f"Failure report saved to: {failure_path}")
                 if self.write_manifest:
                     self._save_run_manifest(
                         output_path=base_path,
@@ -1352,7 +1385,8 @@ class LeafColorPipeline:
         )
         dependency_versions = {}
         for distribution in (
-            "numpy", "opencv-python-headless", "opencv-python", "pandas",
+            "numpy", "opencv-contrib-python-headless", "opencv-python-headless",
+            "opencv-python", "pandas",
             "scikit-image", "rawpy", "torch", "segmentation-models-pytorch",
         ):
             try:
@@ -1363,6 +1397,12 @@ class LeafColorPipeline:
         manifest = {
             "schema_version": 1,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "status": (
+                "cancelled" if self.last_batch_cancelled
+                else "completed_with_errors" if self.last_batch_failures
+                else "completed"
+            ),
+            "cancelled": self.last_batch_cancelled,
             "input_dir": str(Path(image_dir).resolve()),
             "output_table": str(output_path.resolve()),
             "discovered_images": int(discovered_images),

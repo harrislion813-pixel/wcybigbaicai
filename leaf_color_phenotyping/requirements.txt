@@ -4,7 +4,8 @@
 
 # 核心批处理
 numpy>=1.24.0
-opencv-python-headless>=4.8.0
+# contrib 版本包含 ColorChecker 自动检测（cv2.mcc），同时保持无窗口服务器兼容性
+opencv-contrib-python-headless>=4.8.0
 scikit-image>=0.21.0
 
 # RAW 文件读取

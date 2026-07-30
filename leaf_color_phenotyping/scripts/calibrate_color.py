@@ -33,6 +33,11 @@ from src.color_calibration import (  # noqa: E402
     write_calibration_profile,
     xyz_d65_to_srgb,
 )
+from src.calibration_workflow import (  # noqa: E402
+    CalibrationGates,
+    CalibrationProfileRequest,
+    fit_calibration_profile,
+)
 from src.utils import (  # noqa: E402
     COLORCHECKER_24_PATCH_IDS,
     get_colorchecker_reference_lab,
@@ -289,91 +294,42 @@ def command_fit(args: argparse.Namespace) -> int:
     if patch_ids != validation_ids:
         raise ValueError("Training and validation patch orders do not match")
 
-    reference_lab = get_colorchecker_reference_lab(args.reference_id)
-    target_xyz = lab_d50_to_xyz_d65(reference_lab)
-    fit, candidate_metrics, selected_model = _fit_candidates(
-        training_rgb,
-        validation_rgb,
-        target_xyz,
-        args.model,
-    )
-    quality = _quality_report(
-        fit,
-        validation_rgb,
-        target_xyz,
-        patch_ids,
-        args,
-    )
-    quality["candidate_validation_delta_e00"] = candidate_metrics
-
-    reference_srgb_unclipped, _ = xyz_d65_to_srgb(target_xyz)
-    reference_out_of_gamut = np.any(
-        (reference_srgb_unclipped < 0) | (reference_srgb_unclipped > 1),
-        axis=1,
-    )
-    quality["reference_display_out_of_gamut_fraction"] = float(
-        np.mean(reference_out_of_gamut)
-    )
-
-    profile = {
-        "schema_version": 2,
-        "profile_id": args.profile_id,
-        "status": "validated" if quality["passed"] else "draft",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "input": {
-            "kind": args.input_kind,
-            "domain": args.input_domain,
-            "range": [0.0, 1.0],
-            "source_scale": args.input_scale,
-            "channel_order": "RGB",
-            "camera_id": args.camera_id,
-        },
-        "preprocessing": {
-            "white_balance": args.white_balance,
-            "exposure_normalization": args.exposure_normalization,
-            "raw_use_camera_wb": args.raw_use_camera_wb,
-            "gray_card_rgb": args.gray_card_rgb,
-        },
-        "model": {
-            "type": selected_model,
-            "degree": 2 if selected_model == "root_polynomial_2" else 1,
-            "matrix_layout": "features_by_output",
-            "matrix": fit.matrix.tolist(),
-        },
-        "target": {
-            "space": "XYZ",
-            "illuminant": "D65",
-            "observer": "2_degree",
-            "display_encoding": "sRGB with explicit gamut clipping only for display",
-        },
-        "reference": _reference_metadata(args.reference_id),
-        "datasets": {
-            "training": {
-                "path": str(training_path),
-                "sha256": training_sha256,
-                "patch_count": len(patch_ids),
-            },
-            "validation": {
-                "path": str(validation_path),
-                "sha256": validation_sha256,
-                "patch_count": len(validation_ids),
-                "independent": True,
-                "content_distinct_from_training": True,
-            },
-        },
-        "quality": quality,
-        "integrity": {},
-    }
-    output = write_calibration_profile(profile, args.output)
+    result = fit_calibration_profile(CalibrationProfileRequest(
+        training_rgb=training_rgb,
+        validation_rgb=validation_rgb,
+        training_source=training_path,
+        validation_source=validation_path,
+        output_path=Path(args.output),
+        profile_id=args.profile_id,
+        camera_id=args.camera_id,
+        input_kind=args.input_kind,
+        reference_id=args.reference_id,
+        input_domain=args.input_domain,
+        white_balance=args.white_balance,
+        exposure_normalization=args.exposure_normalization,
+        raw_use_camera_wb=args.raw_use_camera_wb,
+        gray_card_rgb=(
+            tuple(float(value) for value in args.gray_card_rgb)
+            if args.gray_card_rgb is not None else None
+        ),
+        model=args.model,
+        source_scale=args.input_scale,
+        gates=CalibrationGates(
+            median_max=args.max_median_delta_e,
+            p95_max=args.max_p95_delta_e,
+            vegetation_mean_max=args.max_vegetation_mean_delta_e,
+            neutral_mean_max=args.max_neutral_mean_delta_e,
+        ),
+    ))
     print(json.dumps({
-        "profile": str(output.resolve()),
+        "profile": str(result.profile_path),
         "profile_id": args.profile_id,
-        "status": profile["status"],
-        "selected_model": selected_model,
-        "validation_delta_e00": quality["validation_delta_e00"],
-        "quality_failures": quality["failures"],
+        "status": result.status,
+        "selected_model": result.selected_model,
+        "validation_delta_e00": result.quality["validation_delta_e00"],
+        "quality_failures": result.quality["failures"],
     }, indent=2, ensure_ascii=False))
-    return 0 if quality["passed"] else 2
+    return 0 if result.status == "validated" else 2
 
 
 def _profile_as_fit(profile: Any) -> CalibrationModelFit:

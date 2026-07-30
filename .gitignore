@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp/
 .test-deps/
 .coverage
 htmlcov/
@@ -8,5 +9,6 @@ htmlcov/
 venv/
 leaf_color_phenotyping/output/
 leaf_color_phenotyping/models/*.pth
+leaf_color_phenotyping/models/*.ccm.json
 leaf_color_phenotyping/data/raw_images/*
 !leaf_color_phenotyping/data/raw_images/.gitkeep

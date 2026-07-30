@@ -8,8 +8,38 @@
 
 颜色校准现在是正式分析的高优先级模块。分割始终使用不受 CCM 影响的图像支路；校正后的颜色只在最终叶片掩膜内计算。跨批次或跨设备定量必须使用通过独立验证的 Calibration Profile v2，不能把裸矩阵或未经验证的拟合当作绝对颜色依据。
 
+## 桌面版（普通用户推荐）
+
+项目现在提供本地桌面界面，日常分析和 CCM 校准不再需要输入命令或修改
+`config.yaml`。完整图文流程见 [桌面版使用指南](GUI_GUIDE.md)。
+
+Windows 首次使用时双击：
+
+```text
+安装桌面版依赖.bat
+```
+
+之后双击：
+
+```text
+启动桌面版.bat
+```
+
+桌面版包括：
+
+- 代表图片分割预检；
+- 批处理实时进度和安全取消；
+- 结果表、失败报告和可视化预览；
+- “相对比较”和“跨批次校准”两种清晰模式；
+- 从两张独立色卡图自动创建并验证 CCM Profile；
+- 自动色卡识别失败时的手工四角工具；
+- validated/draft Profile 状态和兼容性管理。
+
+以下章节保留完整命令行、配置字段和开发接口，适合高级用户。
+
 ## 目录
 
+0. [桌面版（普通用户推荐）](#桌面版普通用户推荐)
 1. [先了解三个重要规则](#一先了解三个重要规则)
 2. [快速开始](#二快速开始)
 3. [完整运行步骤](#三完整运行步骤)
@@ -93,7 +123,10 @@ python -m pip install -r requirements.txt
 
 读取 `.RAF`、`.CR2`、`.NEF`、`.ARW` 等 RAW 文件需要 `rawpy`。它已经写在 `requirements.txt` 中。
 
-`requirements.txt` 足够完成日常批量提取。只有在进行特定工作时，才需要额外安装对应文件：训练 U-Net 使用 `requirements-train.txt`，开发测试使用 `requirements-dev.txt`，颜色校准工具使用 `requirements-calibration.txt`，运行 Notebook 使用 `requirements-notebook.txt`。
+`requirements.txt` 足够完成命令行批量提取。桌面界面使用
+`requirements-gui.txt`；训练 U-Net 使用 `requirements-train.txt`，开发测试使用
+`requirements-dev.txt`，颜色校准命令行工具使用
+`requirements-calibration.txt`，运行 Notebook 使用 `requirements-notebook.txt`。
 
 #### 第 4 步：放入图片
 
