@@ -19,10 +19,10 @@ Windows 首次使用时运行：
 install_gui.cmd
 ```
 
-当前电脑之后双击：
+安装完成后双击：
 
 ```text
-启动桌面版.lnk
+start_gui.cmd
 ```
 
 桌面版包括：

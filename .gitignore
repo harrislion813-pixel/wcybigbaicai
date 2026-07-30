@@ -5,7 +5,6 @@ __pycache__/
 .test-deps/
 .coverage
 gui_startup_error.log
-*.lnk
 htmlcov/
 .venv/
 venv/

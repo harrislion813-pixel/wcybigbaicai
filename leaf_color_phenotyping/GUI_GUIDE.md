@@ -11,12 +11,21 @@ Windows 用户运行 `install_gui.cmd`。脚本会创建项目自己的 `.venv`
 当前版本暂未制作独立安装包，因此电脑仍需预先安装 Python 3.10 或更高版本，
 首次安装依赖时需要联网。
 
-当前工作目录已经生成 `启动桌面版.lnk`。优先双击这个快捷方式，它直接调用
-项目 `.venv` 中的 `pythonw.exe`，不依赖 `.bat` 文件关联，也不会显示命令行窗口。
+安装完成后双击 `start_gui.cmd`。它使用项目 `.venv` 中的 `pythonw.exe` 启动，
+不会显示命令行窗口，也不依赖本机绝对路径。
 
-如果命令脚本被浏览器、安全软件或系统策略拦截，也可以在 PowerShell 中执行
-`python -m pip install -r requirements-gui.txt`。移动项目目录后需要重新生成快捷
-方式，因为快捷方式保存的是当前项目的绝对路径。
+如果命令脚本被浏览器、安全软件或系统策略拦截，也可以在 PowerShell 中执行：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+```
+
+之后运行：
+
+```powershell
+.\.venv\Scripts\pythonw.exe app.py
+```
 
 也可以在已经激活的 Python 环境中运行：
 
