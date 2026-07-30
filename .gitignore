@@ -4,6 +4,8 @@ __pycache__/
 .pytest-tmp/
 .test-deps/
 .coverage
+gui_startup_error.log
+*.lnk
 htmlcov/
 .venv/
 venv/
