@@ -106,7 +106,7 @@ def test_colorchecker_d50_white_adapts_to_neutral_srgb():
 
 
 def test_colorchecker_d65_reference_is_actually_adapted():
-    adapted = get_colorchecker_lab_d65()
+    adapted = get_colorchecker_lab_d65("before_nov_2014")
 
     assert adapted.shape == (24, 3)
     assert np.isfinite(adapted).all()

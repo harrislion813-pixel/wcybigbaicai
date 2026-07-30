@@ -2,30 +2,49 @@
 图像预处理：RAW转换、白平衡、颜色校准（基于ColorChecker色卡）。
 
 核心流程:
-    RAW/JPEG → 标准sRGB → 白平衡 → 颜色校正矩阵(CCM) → 目标色彩空间
+    RAW/JPEG → 显式 RGB 工作域 → 白平衡 → 颜色校正 → 目标色彩空间
 """
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Union
 import json
+import warnings
 
 import numpy as np
 import cv2
 
 from .utils import (
-    COLORCHECKER_24_LAB_D50, rgb_to_lab, delta_e_76, safe_mkdir,
+    COLORCHECKER_24_LAB_D50, delta_e_2000, rgb_to_lab,
     RAW_IMAGE_EXTENSIONS, read_image_rgb, BRADFORD_D50_TO_D65,
+    get_colorchecker_reference_lab,
 )
+
+
+@dataclass(frozen=True)
+class CalibrationFitResult:
+    """Diagnostics produced while fitting a legacy RGB-space CCM."""
+
+    matrix: np.ndarray
+    rank: int
+    condition_number: float
+    residuals: np.ndarray
+    training_delta_e00: Dict[str, float]
+    excluded_patches: Tuple[str, ...] = ()
 
 
 class ImagePreprocessor:
     """图像预处理器 — 处理RAW转RGB、颜色校准等."""
+
+    _SUPPORTED_POLYNOMIAL_DEGREES = {1, 2, 3}
+    _MAX_CCM_CONDITION_NUMBER = 1e8
 
     def __init__(self,
                  target_illuminant: str = "D65",
                  calibration_method: str = "polynomial",
                  polynomial_degree: int = 2,
                  raw_use_camera_wb: bool = True,
-                 raw_output_bps: int = 16):
+                 raw_output_bps: int = 16,
+                 working_domain: str = "encoded_srgb"):
         """
         Args:
             target_illuminant: 目标光源；当前 sRGB/CIELAB 管线仅支持 "D65"
@@ -33,9 +52,16 @@ class ImagePreprocessor:
                 - "linear": 3×3 线性回归
                 - "polynomial": 多项式回归 (推荐)
             polynomial_degree: 多项式阶数 (method="polynomial" 时有效)
+            raw_use_camera_wb: RAW 解码时是否使用相机白平衡
+            raw_output_bps: RAW 后处理位深，8 或 16
+            working_domain: encoded_srgb、linear_srgb 或 camera_linear_rgb
         """
         if str(target_illuminant).upper() != "D65":
             raise ValueError("target_illuminant currently supports only D65")
+        if calibration_method not in {"linear", "polynomial"}:
+            raise ValueError(f"Unknown calibration method: {calibration_method}")
+        if calibration_method == "polynomial":
+            self._validate_polynomial_degree(polynomial_degree)
         self.target_illuminant = "D65"
         self.calibration_method = calibration_method
         self.polynomial_degree = polynomial_degree
@@ -43,12 +69,28 @@ class ImagePreprocessor:
         if raw_output_bps not in (8, 16):
             raise ValueError("raw_output_bps must be 8 or 16")
         self.raw_output_bps = raw_output_bps
+        if working_domain not in {
+            "encoded_srgb", "linear_srgb", "camera_linear_rgb",
+        }:
+            raise ValueError(f"Unknown working_domain: {working_domain}")
+        self.working_domain = working_domain
         self._ccm: Optional[np.ndarray] = None  # 颜色校正矩阵
+        self.last_calibration_report: Optional[CalibrationFitResult] = None
 
     @property
     def has_color_correction_matrix(self) -> bool:
-        """Whether a validated color-correction matrix is available."""
+        """Whether a structurally valid color-correction matrix is available."""
         return self._ccm is not None
+
+    @classmethod
+    def _validate_polynomial_degree(cls, degree: int) -> int:
+        if isinstance(degree, bool) or not isinstance(degree, (int, np.integer)):
+            raise TypeError("polynomial_degree must be an integer")
+        degree = int(degree)
+        if degree not in cls._SUPPORTED_POLYNOMIAL_DEGREES:
+            supported = sorted(cls._SUPPORTED_POLYNOMIAL_DEGREES)
+            raise ValueError(f"polynomial_degree must be one of {supported}")
+        return degree
 
     def set_color_correction_matrix(self, matrix: np.ndarray) -> np.ndarray:
         """Validate and install a precomputed color-correction matrix."""
@@ -104,7 +146,8 @@ class ImagePreprocessor:
     def read_raw(raw_path: str,
                  use_camera_wb: bool = True,
                  output_bps: int = 16,
-                 linear_output: bool = False) -> np.ndarray:
+                 linear_output: bool = False,
+                 output_color: str = "srgb") -> np.ndarray:
         """读取RAW文件并转换为标准sRGB numpy数组.
 
         Args:
@@ -112,6 +155,7 @@ class ImagePreprocessor:
             use_camera_wb: 是否使用相机白平衡系数
             output_bps: 输出位深度 (8 / 16)
             linear_output: 是否返回线性sRGB；默认False以匹配JPEG和下游颜色转换
+            output_color: rawpy 输出空间，"srgb" 或 "raw"
 
         Returns:
             float32 RGB图像, shape (H, W, 3), range [0, 1]
@@ -125,9 +169,15 @@ class ImagePreprocessor:
 
         with rawpy.imread(str(raw_path)) as raw:
             gamma = (1, 1) if linear_output else (2.222, 4.5)
+            if output_color == "srgb":
+                rawpy_color_space = rawpy.ColorSpace.sRGB
+            elif output_color == "raw":
+                rawpy_color_space = rawpy.ColorSpace.raw
+            else:
+                raise ValueError("output_color must be 'srgb' or 'raw'")
             rgb = raw.postprocess(
                 use_camera_wb=use_camera_wb,
-                output_color=rawpy.ColorSpace.sRGB,
+                output_color=rawpy_color_space,
                 gamma=gamma,
                 no_auto_bright=True,
                 output_bps=16 if output_bps == 16 else 8,
@@ -209,7 +259,9 @@ class ImagePreprocessor:
         self,
         measured_rgb: np.ndarray,      # (N, 3) — 图像中检测到的色块RGB
         reference_lab: np.ndarray = None,  # (N, 3) — 色卡参考Lab值
-    ) -> np.ndarray:
+        reference_id: Optional[str] = None,
+        return_report: bool = False,
+    ) -> Union[np.ndarray, CalibrationFitResult]:
         """由 ColorChecker 色块计算颜色校正矩阵.
 
         计算流程:
@@ -227,32 +279,125 @@ class ImagePreprocessor:
             CCM: 若 method="linear", shape (3, 3);
                  若 method="polynomial" degree=2, shape (9, 3)
         """
-        if reference_lab is None:
+        if reference_lab is not None and reference_id is not None:
+            raise ValueError("Provide reference_lab or reference_id, not both")
+        if reference_id is not None:
+            reference_lab = get_colorchecker_reference_lab(reference_id)
+        elif reference_lab is None:
+            warnings.warn(
+                "Implicit ColorChecker reference uses the pre-November-2014 "
+                "chart. Pass reference_id explicitly for reproducible calibration.",
+                FutureWarning,
+                stacklevel=2,
+            )
             reference_lab = COLORCHECKER_24_LAB_D50
+
+        src, reference_lab = self._validate_calibration_samples(
+            measured_rgb, reference_lab
+        )
 
         # 参考Lab → 目标RGB (简化: 使用标准sRGB的前向模型)
         # 实际使用中建议用 colour-science 库做 Lab→XYZ→RGB 的精确转换
         ref_rgb = self._lab_to_srgb_approx(reference_lab)
 
-        # ---- 确保色块数量一致 ----
-        n_patches = min(len(measured_rgb), len(ref_rgb))
-        src = measured_rgb[:n_patches]
-        dst = ref_rgb[:n_patches]
-
         if self.calibration_method == "linear":
             A = src  # (N, 3)
-            # 最小二乘: M = A^-1 @ dst
-            M, _, _, _ = np.linalg.lstsq(A, dst, rcond=None)
-            self.set_color_correction_matrix(M)
         elif self.calibration_method == "polynomial":
             A = self._expand_polynomial(src, self.polynomial_degree)
-            M, _, _, _ = np.linalg.lstsq(A, dst, rcond=None)
-            self.set_color_correction_matrix(M)
         else:
             raise ValueError(f"Unknown calibration method: {self.calibration_method}")
 
-        print(f"[ColorCalibration] CCM computed, shape={self._ccm.shape}")
+        n_terms = A.shape[1]
+        minimum_patches = 2 * n_terms
+        if len(src) < minimum_patches:
+            raise ValueError(
+                f"CCM fitting requires at least {minimum_patches} patches for "
+                f"{n_terms} model terms; received {len(src)}"
+            )
+
+        rank = int(np.linalg.matrix_rank(A))
+        if rank != n_terms:
+            raise ValueError(
+                f"CCM design matrix is rank deficient: rank={rank}, terms={n_terms}"
+            )
+        condition_number = float(np.linalg.cond(A))
+        if not np.isfinite(condition_number):
+            raise ValueError("CCM design matrix condition number is not finite")
+        if condition_number > self._MAX_CCM_CONDITION_NUMBER:
+            raise ValueError(
+                "CCM design matrix is ill-conditioned: "
+                f"condition_number={condition_number:.6g} exceeds "
+                f"{self._MAX_CCM_CONDITION_NUMBER:.6g}"
+            )
+
+        M, residuals, fitted_rank, _ = np.linalg.lstsq(A, ref_rgb, rcond=None)
+        if int(fitted_rank) != n_terms:
+            raise ValueError(
+                f"CCM least-squares fit lost rank: rank={fitted_rank}, terms={n_terms}"
+            )
+        self.set_color_correction_matrix(M)
+
+        fitted_rgb = np.clip(A @ self._ccm, 0, 1)
+        fitted_lab = rgb_to_lab(fitted_rgb.reshape(-1, 1, 3))[:, 0, :]
+        reference_lab_d65 = rgb_to_lab(ref_rgb.reshape(-1, 1, 3))[:, 0, :]
+        delta_e = np.asarray(
+            delta_e_2000(fitted_lab, reference_lab_d65), dtype=np.float64
+        )
+        delta_metrics = {
+            "mean": float(np.mean(delta_e)),
+            "median": float(np.median(delta_e)),
+            "p95": float(np.percentile(delta_e, 95)),
+            "max": float(np.max(delta_e)),
+        }
+        self.last_calibration_report = CalibrationFitResult(
+            matrix=self._ccm.copy(),
+            rank=rank,
+            condition_number=condition_number,
+            residuals=np.asarray(residuals, dtype=np.float64),
+            training_delta_e00=delta_metrics,
+        )
+
+        print(
+            f"[ColorCalibration] CCM computed, shape={self._ccm.shape}, "
+            f"rank={rank}, condition={condition_number:.3g}, "
+            f"median_dE00={delta_metrics['median']:.3f}"
+        )
+        if return_report:
+            return self.last_calibration_report
         return self._ccm
+
+    @staticmethod
+    def _validate_calibration_samples(
+        measured_rgb: np.ndarray,
+        reference_lab: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Validate paired patch measurements before any regression is attempted."""
+        measured = np.asarray(measured_rgb, dtype=np.float64)
+        reference = np.asarray(reference_lab, dtype=np.float64)
+
+        if measured.ndim != 2 or measured.shape[1:] != (3,):
+            raise ValueError("measured_rgb must have shape (N, 3)")
+        if reference.ndim != 2 or reference.shape[1:] != (3,):
+            raise ValueError("reference_lab must have shape (N, 3)")
+        if len(measured) == 0:
+            raise ValueError("calibration patch arrays must not be empty")
+        if len(measured) != len(reference):
+            raise ValueError(
+                "measured_rgb and reference_lab must contain the same number "
+                f"of patches; received {len(measured)} and {len(reference)}"
+            )
+        if not np.isfinite(measured).all():
+            raise ValueError("measured_rgb contains NaN or infinite values")
+        if not np.isfinite(reference).all():
+            raise ValueError("reference_lab contains NaN or infinite values")
+        if np.any(measured < 0) or np.any(measured > 1):
+            raise ValueError(
+                "measured_rgb must be normalized to [0, 1]; declare and "
+                "normalize 8/16-bit input before fitting"
+            )
+        if np.any(reference[:, 0] < 0) or np.any(reference[:, 0] > 100):
+            raise ValueError("reference_lab L* values must be in [0, 100]")
+        return measured, reference
 
     def apply_color_correction(self, img_rgb: np.ndarray) -> np.ndarray:
         """对图像应用已计算的CCM.
@@ -266,6 +411,14 @@ class ImagePreprocessor:
         if self._ccm is None:
             print("WARNING: CCM not computed yet, returning original image.")
             return img_rgb
+
+        img_rgb = np.asarray(img_rgb)
+        if img_rgb.ndim != 3 or img_rgb.shape[-1] != 3:
+            raise ValueError("img_rgb must have shape (H, W, 3)")
+        if not np.isfinite(img_rgb).all():
+            raise ValueError("img_rgb contains NaN or infinite values")
+        if np.any(img_rgb < 0) or np.any(img_rgb > 1):
+            raise ValueError("img_rgb must be normalized to [0, 1]")
 
         h, w = img_rgb.shape[:2]
         pixels = img_rgb.reshape(-1, 3)
@@ -300,12 +453,18 @@ class ImagePreprocessor:
             compute_derived: 是否同时计算 HSV 和 CIELAB；批处理可在裁剪后再计算
 
         Returns:
-            {"rgb": ..., "lab": ..., "hsv": ...} 预处理后的多色彩空间图像
+            预处理后的多色彩空间图像；`segmentation_rgb`（可用时）始终是
+            CCM 与表型白平衡之前的 encoded-sRGB 分割代理图。
         """
         # Step 1: 读取
         ext = Path(image_path).suffix.lower()
+        segmentation_img = None
         if ext in RAW_IMAGE_EXTENSIONS:
-            if self.raw_use_camera_wb and self.raw_output_bps == 16:
+            if (
+                self.working_domain == "encoded_srgb"
+                and self.raw_use_camera_wb
+                and self.raw_output_bps == 16
+            ):
                 # Preserve the historical one-argument call for the default path.
                 img = self.read_raw(image_path)
             else:
@@ -313,9 +472,22 @@ class ImagePreprocessor:
                     image_path,
                     use_camera_wb=self.raw_use_camera_wb,
                     output_bps=self.raw_output_bps,
+                    linear_output=self.working_domain != "encoded_srgb",
+                    output_color=(
+                        "raw" if self.working_domain == "camera_linear_rgb" else "srgb"
+                    ),
                 )
+            if self.working_domain == "encoded_srgb":
+                segmentation_img = img.copy()
         else:
+            if self.working_domain == "camera_linear_rgb":
+                raise ValueError(
+                    "camera_linear_rgb calibration profiles require RAW input images"
+                )
             img = self.read_image(image_path)
+            segmentation_img = img.copy()
+            if self.working_domain == "linear_srgb":
+                img = self._decode_srgb(img)
 
         # Step 2: 白平衡
         if white_balance_method == "gray_world":
@@ -343,6 +515,8 @@ class ImagePreprocessor:
             "rgb": img,
             "rgb_uint8": img_uint8,
         }
+        if segmentation_img is not None:
+            result["segmentation_rgb"] = segmentation_img
         if compute_derived:
             result["hsv"] = cv2.cvtColor(
                 cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2HSV
@@ -350,9 +524,32 @@ class ImagePreprocessor:
             result["lab"] = rgb_to_lab(img)
         return result
 
+    def process_segmentation_image(self, image_path: str) -> np.ndarray:
+        """Decode an encoded-sRGB proxy that is independent of phenotype CCM."""
+        ext = Path(image_path).suffix.lower()
+        if ext in RAW_IMAGE_EXTENSIONS:
+            return self.read_raw(
+                image_path,
+                use_camera_wb=self.raw_use_camera_wb,
+                output_bps=self.raw_output_bps,
+                linear_output=False,
+                output_color="srgb",
+            )
+        return self.read_image(image_path)
+
     # ----------------------------------------------------------
     # 辅助方法
     # ----------------------------------------------------------
+    @staticmethod
+    def _decode_srgb(img_rgb: np.ndarray) -> np.ndarray:
+        values = np.asarray(img_rgb, dtype=np.float64)
+        linear = np.where(
+            values <= 0.04045,
+            values / 12.92,
+            ((values + 0.055) / 1.055) ** 2.4,
+        )
+        return linear.astype(np.float32)
+
     @staticmethod
     def _expand_polynomial(rgb: np.ndarray, degree: int = 2) -> np.ndarray:
         """将 RGB 向量展开为多项式特征.
@@ -360,6 +557,10 @@ class ImagePreprocessor:
         degree=2: [R, G, B, R², G², B², RG, RB, GB], shape (N, 9)
         degree=3: 再加三次项 (共 19 项)
         """
+        degree = ImagePreprocessor._validate_polynomial_degree(degree)
+        rgb = np.asarray(rgb, dtype=np.float64)
+        if rgb.ndim != 2 or rgb.shape[1:] != (3,):
+            raise ValueError("rgb polynomial input must have shape (N, 3)")
         R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
         terms = [R, G, B]
 
@@ -378,6 +579,10 @@ class ImagePreprocessor:
 
         精确转换建议使用 colour-science 库.
         """
+        lab = np.asarray(lab, dtype=np.float64)
+        if lab.ndim != 2 or lab.shape[1:] != (3,):
+            raise ValueError("lab must have shape (N, 3)")
+
         # Lab → XYZ (D50 白点)
         L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
 

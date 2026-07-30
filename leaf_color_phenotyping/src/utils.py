@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import warnings
 from pathlib import Path
 from typing import Tuple, Optional, Dict, List, Union
 
@@ -240,7 +241,9 @@ def xyz_to_lab(img_xyz: np.ndarray) -> np.ndarray:
     xyz[..., 2] /= zn
 
     delta = 6 / 29
-    t = xyz ** (1 / 3)
+    # np.cbrt keeps negative out-of-gamut XYZ values finite until the CIELAB
+    # piecewise linear branch replaces them. Fractional ``** (1/3)`` does not.
+    t = np.cbrt(xyz)
     mask = xyz <= delta ** 3
     t[mask] = xyz[mask] / (3 * delta ** 2) + 4 / 29
 
@@ -376,9 +379,36 @@ def histogram_features(channel: np.ndarray, bins: int = 32) -> Dict[str, float]:
 # 参考色卡值
 # ============================================================
 
-# X-Rite ColorChecker Classic 24 色块在 CIE Lab (D50) 下的参考值
-# 来源: X-Rite 官方数据, 基于D50光源, 2° 观察者
-# 若使用 D65 光源, 需要光源转换
+# X-Rite ColorChecker Classic 24 色块在 CIE Lab (D50) 下的参考值。
+# 这组 2005 数据只对应 2014 年 11 月以前生产的色卡；保留旧名称用于兼容。
+# 若使用 D65 光源, 需要光源转换。
+COLORCHECKER_24_PATCH_IDS = (
+    "dark_skin",
+    "light_skin",
+    "blue_sky",
+    "foliage",
+    "blue_flower",
+    "bluish_green",
+    "orange",
+    "purplish_blue",
+    "moderate_red",
+    "purple",
+    "yellow_green",
+    "orange_yellow",
+    "blue",
+    "green",
+    "red",
+    "yellow",
+    "magenta",
+    "cyan",
+    "white_95",
+    "neutral_8",
+    "neutral_65",
+    "neutral_5",
+    "neutral_35",
+    "black_2",
+)
+
 COLORCHECKER_24_LAB_D50 = np.array([
     # Row 1 (棕 → 蓝)
     [37.986, 13.555, 14.059],   # 1  dark skin
@@ -410,6 +440,53 @@ COLORCHECKER_24_LAB_D50 = np.array([
     [20.461, -0.079, -0.973],   # 24 black
 ], dtype=np.float64)
 
+COLORCHECKER_24_BEFORE_NOV_2014_LAB_D50 = COLORCHECKER_24_LAB_D50
+
+# X-Rite 2016 发布、对应 2014 年 11 月以后配方的 ColorChecker Classic 24。
+COLORCHECKER_24_AFTER_NOV_2014_LAB_D50 = np.array([
+    [37.54, 14.37, 14.92],
+    [64.66, 19.27, 17.50],
+    [49.32, -3.82, -22.54],
+    [43.46, -12.74, 22.72],
+    [54.94, 9.61, -24.79],
+    [70.48, -32.26, -0.37],
+    [62.73, 35.83, 56.50],
+    [39.43, 10.75, -45.17],
+    [50.57, 48.64, 16.67],
+    [30.10, 22.54, -20.87],
+    [71.77, -24.13, 58.19],
+    [71.51, 18.24, 67.37],
+    [28.37, 15.42, -49.80],
+    [54.38, -39.72, 32.27],
+    [42.43, 51.05, 28.62],
+    [81.80, 2.67, 80.41],
+    [50.63, 51.28, -14.12],
+    [49.57, -29.71, -28.32],
+    [95.19, -1.03, 2.93],
+    [81.29, -0.57, 0.44],
+    [66.89, -0.75, -0.06],
+    [50.76, -0.13, 0.14],
+    [35.63, -0.46, -0.48],
+    [20.64, 0.07, -0.46],
+], dtype=np.float64)
+
+COLORCHECKER_REFERENCE_LAB_D50 = {
+    "before_nov_2014": COLORCHECKER_24_BEFORE_NOV_2014_LAB_D50,
+    "after_nov_2014": COLORCHECKER_24_AFTER_NOV_2014_LAB_D50,
+}
+
+
+def get_colorchecker_reference_lab(reference_id: str) -> np.ndarray:
+    """Return a copy of an explicitly versioned ColorChecker D50 Lab reference."""
+    try:
+        reference = COLORCHECKER_REFERENCE_LAB_D50[reference_id]
+    except KeyError as exc:
+        supported = sorted(COLORCHECKER_REFERENCE_LAB_D50)
+        raise ValueError(
+            f"Unknown ColorChecker reference '{reference_id}'; use one of {supported}"
+        ) from exc
+    return reference.copy()
+
 # D50 → D65 Bradford 色适应矩阵
 BRADFORD_D50_TO_D65 = np.array([
     [0.9555766, -0.0230393, 0.0631636],
@@ -418,9 +495,17 @@ BRADFORD_D50_TO_D65 = np.array([
 ], dtype=np.float64)
 
 
-def get_colorchecker_lab_d65() -> np.ndarray:
-    """Adapt built-in ColorChecker Lab values from D50 to D65 using Bradford."""
-    lab_d50 = COLORCHECKER_24_LAB_D50
+def get_colorchecker_lab_d65(reference_id: str = None) -> np.ndarray:
+    """Adapt an explicitly versioned ColorChecker reference from D50 to D65."""
+    if reference_id is None:
+        warnings.warn(
+            "Implicit ColorChecker reference uses the pre-November-2014 chart. "
+            "Pass reference_id explicitly for reproducible calibration.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        reference_id = "before_nov_2014"
+    lab_d50 = get_colorchecker_reference_lab(reference_id)
     L, a, b = lab_d50[:, 0], lab_d50[:, 1], lab_d50[:, 2]
     fy = (L + 16) / 116
     fx = a / 500 + fy

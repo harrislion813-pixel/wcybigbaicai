@@ -13,8 +13,8 @@ from src.pipeline import LeafColorPipeline
 from src.preprocessing import ImagePreprocessor
 from src.segmentation import BaseSegmenter, GrabCutSegmenter, UNetSegmenter
 from src.utils import (
-    find_images, parse_sample_id, read_image_rgb, split_pairs_by_sample,
-    write_image_rgb,
+    COLORCHECKER_24_LAB_D50, find_images, parse_sample_id, read_image_rgb,
+    split_pairs_by_sample, write_image_rgb,
 )
 
 
@@ -70,6 +70,66 @@ def test_invalid_ccm_shape_is_rejected():
 
     with pytest.raises(ValueError, match="CCM shape"):
         preprocessor.set_color_correction_matrix(np.eye(2))
+
+
+def test_ccm_fit_rejects_unnormalized_rgb():
+    preprocessor = ImagePreprocessor(calibration_method="linear")
+    measured = np.tile([128, 64, 32], (24, 1))
+
+    with pytest.raises(ValueError, match=r"normalized to \[0, 1\]"):
+        preprocessor.compute_color_correction_matrix(
+            measured, reference_id="before_nov_2014"
+        )
+
+
+def test_ccm_fit_rejects_empty_and_mismatched_patch_sets():
+    preprocessor = ImagePreprocessor(calibration_method="linear")
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        preprocessor.compute_color_correction_matrix(
+            np.empty((0, 3)), np.empty((0, 3))
+        )
+    with pytest.raises(ValueError, match="same number"):
+        preprocessor.compute_color_correction_matrix(
+            np.ones((6, 3)) * 0.5, np.ones((7, 3)) * 50
+        )
+
+
+def test_ccm_fit_rejects_rank_deficient_patches():
+    preprocessor = ImagePreprocessor(calibration_method="linear")
+    measured = np.tile([0.2, 0.4, 0.6], (24, 1))
+
+    with pytest.raises(ValueError, match="rank deficient"):
+        preprocessor.compute_color_correction_matrix(
+            measured, reference_id="before_nov_2014"
+        )
+
+
+def test_ccm_fit_accepts_integer_lab_after_float_conversion():
+    rng = np.random.default_rng(7)
+    measured = rng.uniform(0.05, 0.95, size=(24, 3))
+    integer_lab = np.rint(COLORCHECKER_24_LAB_D50).astype(np.int64)
+    preprocessor = ImagePreprocessor(calibration_method="linear")
+
+    matrix = preprocessor.compute_color_correction_matrix(measured, integer_lab)
+
+    assert matrix.shape == (3, 3)
+    assert preprocessor.last_calibration_report is not None
+    assert preprocessor.last_calibration_report.rank == 3
+
+    report = preprocessor.compute_color_correction_matrix(
+        measured, integer_lab, return_report=True
+    )
+    assert report.matrix.shape == (3, 3)
+    assert set(report.training_delta_e00) == {"mean", "median", "p95", "max"}
+
+
+@pytest.mark.parametrize("degree", [0, 4, 10])
+def test_unsupported_polynomial_degree_is_rejected(degree):
+    with pytest.raises(ValueError, match="polynomial_degree"):
+        ImagePreprocessor(
+            calibration_method="polynomial", polynomial_degree=degree
+        )
 
 
 def test_find_images_includes_uppercase_raf(tmp_path):
@@ -339,6 +399,83 @@ def test_synthetic_image_runs_through_batch_pipeline(tmp_path):
     assert manifest["failed_images"] == 0
     assert len(manifest["config_sha256"]) == 64
     assert pipeline.last_batch_failures == []
+
+
+def test_ccm_changes_color_features_without_changing_segmentation_mask(tmp_path):
+    image = np.full((80, 80, 3), 255, dtype=np.uint8)
+    image[20:60, 25:55] = [30, 160, 30]
+    image_path = tmp_path / "leaf.png"
+    write_image_rgb(image_path, image)
+    common = {
+        "segmentation": {
+            "method": "exg",
+            "min_leaf_area_ratio": 0.01,
+            "exclude_white_tissue": False,
+        },
+        "features": {
+            "vegetation_indices": {"enabled": False},
+            "texture": {"enabled": False},
+            "shape": {"enabled": False},
+        },
+    }
+    uncalibrated = LeafColorPipeline(common)
+    calibrated = LeafColorPipeline({
+        **common,
+        "color_calibration": {
+            "enabled": True,
+            "method": "linear",
+            "matrix": [[0, 1, 0], [1, 0, 0], [0, 0, 1]],
+        },
+    })
+
+    baseline = uncalibrated.process_single(
+        str(image_path), return_visualization=True, verbose=False
+    )
+    corrected = calibrated.process_single(
+        str(image_path), return_visualization=True, verbose=False
+    )
+
+    assert np.array_equal(baseline["mask"], corrected["mask"])
+    assert baseline["features"]["RGB_G_mean"] > baseline["features"]["RGB_R_mean"]
+    assert corrected["features"]["RGB_R_mean"] > corrected["features"]["RGB_G_mean"]
+
+
+def test_pipeline_applies_ccm_only_after_leaf_crop(tmp_path, monkeypatch):
+    image = np.full((100, 120, 3), 255, dtype=np.uint8)
+    image[30:70, 45:75] = [30, 160, 30]
+    image_path = tmp_path / "leaf.png"
+    write_image_rgb(image_path, image)
+    pipeline = LeafColorPipeline({
+        "color_calibration": {
+            "enabled": True,
+            "method": "linear",
+            "matrix": np.eye(3).tolist(),
+        },
+        "segmentation": {
+            "method": "exg",
+            "min_leaf_area_ratio": 0.01,
+            "exclude_white_tissue": False,
+        },
+        "features": {
+            "vegetation_indices": {"enabled": False},
+            "texture": {"enabled": False},
+            "shape": {"enabled": False},
+        },
+    })
+    seen_shapes = []
+    apply_ccm = pipeline.preprocessor.apply_color_correction
+
+    def record_shape(rgb):
+        seen_shapes.append(rgb.shape)
+        return apply_ccm(rgb)
+
+    monkeypatch.setattr(pipeline.preprocessor, "apply_color_correction", record_shape)
+
+    pipeline.process_single(str(image_path), verbose=False)
+
+    assert len(seen_shapes) == 1
+    assert seen_shapes[0][0] < image.shape[0]
+    assert seen_shapes[0][1] < image.shape[1]
 
 
 def test_process_single_rejects_metadata_that_overwrites_reserved_fields(tmp_path):

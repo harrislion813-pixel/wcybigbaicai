@@ -11,6 +11,7 @@ import json
 import platform
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -21,6 +22,11 @@ import cv2
 import pandas as pd
 
 from .preprocessing import ImagePreprocessor
+from .color_calibration import (
+    CalibrationProfile,
+    apply_calibration_profile,
+    load_calibration_profile,
+)
 from .segmentation import BaseSegmenter, ExGSegmenter, GrabCutSegmenter, create_segmenter
 from .color_features import ColorFeatureExtractor
 from .vegetation_indices import VegetationIndexExtractor
@@ -28,7 +34,7 @@ from .texture_features import (
     GLCMTextureExtractor, LeafShapeExtractor, ColorTextureAnalyzer
 )
 from .utils import (
-    find_images, parse_sample_id, rgb_to_hsv, rgb_to_lab, safe_mkdir,
+    RAW_IMAGE_EXTENSIONS, find_images, parse_sample_id, rgb_to_hsv, rgb_to_lab, safe_mkdir,
     write_image_rgb,
 )
 
@@ -68,7 +74,19 @@ class LeafColorPipeline:
         self._validate_config(self.config)
 
         imaging = self.config.get("imaging", {})
+        calibration = self.config.get("color_calibration", {})
+        self.color_calibration_mode = self._resolve_color_calibration_mode(calibration)
+        self.color_calibration_profile: Optional[CalibrationProfile] = None
+        self.color_calibration_status = (
+            "off" if self.color_calibration_mode == "off" else "not_configured"
+        )
+        self.color_calibration_source: Optional[str] = None
+        self.color_calibration_matrix_sha256: Optional[str] = None
         self.default_white_balance = imaging.get("white_balance", "none")
+        self.camera_id = imaging.get("camera_id", "")
+        self.default_exposure_normalization = imaging.get(
+            "exposure_normalization", "fixed_capture"
+        )
         gray_card_rgb = imaging.get("gray_card_rgb")
         self.default_gray_roi = (
             np.asarray(gray_card_rgb, dtype=np.float32)
@@ -129,6 +147,45 @@ class LeafColorPipeline:
             raise ValueError(f"Unknown white balance method: {white_balance}")
         if imaging.get("bits_per_channel", 16) not in (8, 16):
             raise ValueError("imaging.bits_per_channel must be 8 or 16")
+        if not isinstance(imaging.get("raw_use_camera_wb", True), bool):
+            raise TypeError("imaging.raw_use_camera_wb must be boolean")
+        if not isinstance(
+            imaging.get("exposure_normalization", "fixed_capture"), str
+        ):
+            raise TypeError("imaging.exposure_normalization must be a string")
+        if not isinstance(imaging.get("camera_id", ""), str):
+            raise TypeError("imaging.camera_id must be a string")
+        gray_card_rgb = imaging.get("gray_card_rgb")
+        if white_balance == "gray_card" and gray_card_rgb is None:
+            raise ValueError("imaging.gray_card_rgb is required for gray_card white balance")
+        if gray_card_rgb is not None:
+            try:
+                gray_card = np.asarray(gray_card_rgb, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("imaging.gray_card_rgb must contain three numbers") from exc
+            if (
+                gray_card.shape != (3,)
+                or not np.isfinite(gray_card).all()
+                or np.any(gray_card <= 0)
+                or np.any(gray_card > 1)
+            ):
+                raise ValueError("imaging.gray_card_rgb must contain three values in (0, 1]")
+
+        calibration = config.get("color_calibration", {})
+        if not isinstance(calibration, dict):
+            raise TypeError("color_calibration config must be a mapping")
+        if "mode" in calibration and calibration["mode"] not in {
+            "off", "optional", "required",
+        }:
+            raise ValueError(
+                "color_calibration.mode must be 'off', 'optional', or 'required'"
+            )
+        for key in ("enabled", "allow_legacy_matrix"):
+            if key in calibration and not isinstance(calibration[key], bool):
+                raise TypeError(f"color_calibration.{key} must be boolean")
+        for key in ("profile_file", "ccm_file"):
+            if key in calibration and not isinstance(calibration[key], str):
+                raise TypeError(f"color_calibration.{key} must be a string")
 
         segmentation = config.get("segmentation", {})
         if not isinstance(segmentation, dict):
@@ -187,30 +244,185 @@ class LeafColorPipeline:
             if key in output and not isinstance(output[key], bool):
                 raise TypeError(f"output.{key} must be boolean")
 
+    @staticmethod
+    def _resolve_color_calibration_mode(calibration: Dict) -> str:
+        if "mode" in calibration:
+            return calibration["mode"]
+        return "optional" if calibration.get("enabled", False) else "off"
+
+    @staticmethod
+    def _matrix_sha256(matrix: np.ndarray) -> str:
+        canonical = np.asarray(matrix, dtype="<f8", order="C")
+        return hashlib.sha256(canonical.tobytes()).hexdigest()
+
+    @property
+    def color_calibration_applied(self) -> bool:
+        return self.color_calibration_status in {
+            "applied_validated_profile", "applied_legacy_matrix",
+        }
+
+    def _resolve_calibration_path(self, configured_path: str) -> Path:
+        path = Path(configured_path)
+        if not path.is_absolute():
+            path = Path(self.config.get("_config_dir", ".")) / path
+        return path
+
     def _init_preprocessor(self) -> ImagePreprocessor:
         calib = self.config.get("color_calibration", {})
         imaging = self.config.get("imaging", {})
+        profile_file = calib.get("profile_file")
+        profile: Optional[CalibrationProfile] = None
+        calibration_method = calib.get("method", "polynomial")
+        polynomial_degree = calib.get("polynomial_degree", 2)
+        working_domain = "encoded_srgb"
+
+        if self.color_calibration_mode != "off" and profile_file:
+            profile_path = self._resolve_calibration_path(profile_file)
+            profile = load_calibration_profile(profile_path)
+            self.color_calibration_profile = profile
+            self.color_calibration_source = str(profile_path.resolve())
+            if profile.status != "validated":
+                self.color_calibration_status = "profile_not_validated"
+                if self.color_calibration_mode == "required":
+                    raise ValueError(
+                        "required color calibration needs a validated profile"
+                    )
+                profile = None
+            else:
+                profile_preprocessing = profile.data["preprocessing"]
+                mismatches = []
+                if profile.data["input"]["camera_id"] != self.camera_id:
+                    mismatches.append("camera_id")
+                if profile_preprocessing["white_balance"] != self.default_white_balance:
+                    mismatches.append("white_balance")
+                if profile_preprocessing["white_balance"] == "gray_card":
+                    profile_gray = np.asarray(
+                        profile_preprocessing["gray_card_rgb"], dtype=np.float64
+                    )
+                    if (
+                        self.default_gray_roi is None
+                        or not np.allclose(profile_gray, self.default_gray_roi)
+                    ):
+                        mismatches.append("gray_card_rgb")
+                if (
+                    profile_preprocessing["exposure_normalization"]
+                    != self.default_exposure_normalization
+                ):
+                    mismatches.append("exposure_normalization")
+                if (
+                    profile.data["input"]["kind"] == "raw"
+                    and profile_preprocessing["raw_use_camera_wb"]
+                    != imaging.get("raw_use_camera_wb", True)
+                ):
+                    mismatches.append("raw_use_camera_wb")
+                if mismatches:
+                    self.color_calibration_status = "profile_preprocessing_mismatch"
+                    if self.color_calibration_mode == "required":
+                        raise ValueError(
+                            "calibration profile preprocessing does not match runtime: "
+                            + ", ".join(mismatches)
+                        )
+                    profile = None
+
+            if profile is not None:
+                target_space = profile.data["target"]["space"]
+                supported_pair = (
+                    profile.input_domain == "encoded_srgb" and target_space == "sRGB"
+                ) or (
+                    profile.input_domain in {"linear_srgb", "camera_linear_rgb"}
+                    and target_space == "XYZ"
+                )
+                if not supported_pair:
+                    self.color_calibration_status = "profile_domain_unsupported"
+                    if self.color_calibration_mode == "required":
+                        raise ValueError(
+                            "calibration profile input.domain and target.space are "
+                            "not a supported runtime pair"
+                        )
+                    profile = None
+
+            if profile is not None:
+                working_domain = profile.input_domain
+
+            if profile is not None and profile.model_type == "linear_3x3":
+                calibration_method = "linear"
+                polynomial_degree = 1
+            elif profile is not None and profile.model_type == "legacy_polynomial":
+                if profile.input_domain != "encoded_srgb":
+                    raise ValueError(
+                        "legacy_polynomial profiles require encoded_srgb input"
+                    )
+                calibration_method = "polynomial"
+                polynomial_degree = profile.degree
+            elif profile is not None and profile.model_type == "root_polynomial_2":
+                if profile.input_domain == "encoded_srgb":
+                    raise ValueError(
+                        "root_polynomial_2 profiles require a linear RGB input domain"
+                    )
+                calibration_method = "linear"
+                polynomial_degree = 1
+            elif profile is not None:
+                self.color_calibration_status = "profile_model_unsupported"
+                if self.color_calibration_mode == "required":
+                    raise ValueError(
+                        f"profile model '{profile.model_type}' is not supported by this runtime"
+                    )
+                profile = None
+                working_domain = "encoded_srgb"
+
         preprocessor = ImagePreprocessor(
             target_illuminant=imaging.get("target_illuminant", "D65"),
-            calibration_method=calib.get("method", "polynomial"),
-            polynomial_degree=calib.get("polynomial_degree", 2),
+            calibration_method=calibration_method,
+            polynomial_degree=polynomial_degree,
             raw_use_camera_wb=imaging.get("raw_use_camera_wb", True),
             raw_output_bps=imaging.get("bits_per_channel", 16),
+            working_domain=working_domain,
         )
-        if not calib.get("enabled", False):
+        if self.color_calibration_mode == "off":
             return preprocessor
 
+        if profile is not None:
+            if profile.data["target"]["space"] == "sRGB":
+                preprocessor.set_color_correction_matrix(profile.matrix)
+            self.color_calibration_status = "applied_validated_profile"
+            self.color_calibration_matrix_sha256 = self._matrix_sha256(profile.matrix)
+            return preprocessor
+
+        if profile_file:
+            return preprocessor
+
+        legacy_requested = calib.get("enabled", False) or (
+            calib.get("matrix") is not None or bool(calib.get("ccm_file"))
+        )
+        if not legacy_requested:
+            if self.color_calibration_mode == "required":
+                raise ValueError(
+                    "color_calibration.mode=required requires a validated profile_file"
+                )
+            return preprocessor
+
+        explicit_mode = "mode" in calib
+        allow_legacy = calib.get("allow_legacy_matrix", not explicit_mode)
+        if self.color_calibration_mode == "required" or not allow_legacy:
+            raise ValueError(
+                "legacy bare CCM matrices are not allowed; provide a validated "
+                "profile_file or set allow_legacy_matrix=true in optional mode"
+            )
+
         if calib.get("matrix") is not None:
-            preprocessor.set_color_correction_matrix(calib["matrix"])
+            matrix = preprocessor.set_color_correction_matrix(calib["matrix"])
+            self.color_calibration_status = "applied_legacy_matrix"
+            self.color_calibration_source = "inline_matrix"
+            self.color_calibration_matrix_sha256 = self._matrix_sha256(matrix)
             return preprocessor
 
         ccm_file = calib.get("ccm_file")
         if ccm_file:
-            ccm_path = Path(ccm_file)
-            if not ccm_path.is_absolute():
-                config_dir = Path(self.config.get("_config_dir", "."))
-                ccm_path = config_dir / ccm_path
-            preprocessor.load_color_correction_matrix(str(ccm_path))
+            ccm_path = self._resolve_calibration_path(ccm_file)
+            matrix = preprocessor.load_color_correction_matrix(str(ccm_path))
+            self.color_calibration_status = "applied_legacy_matrix"
+            self.color_calibration_source = str(ccm_path.resolve())
+            self.color_calibration_matrix_sha256 = self._matrix_sha256(matrix)
             return preprocessor
 
         raise ValueError(
@@ -336,15 +548,51 @@ class LeafColorPipeline:
             str(img_path),
             white_balance_method=wb_method,
             gray_roi=wb_gray_roi,
+            apply_ccm=False,
             compute_derived=False,
         )
         img_rgb = preprocessed["rgb"]
-        img_uint8 = preprocessed["rgb_uint8"]
+        segmentation_base_rgb = preprocessed.get("segmentation_rgb")
+        if segmentation_base_rgb is None:
+            segmentation_base_rgb = self.preprocessor.process_segmentation_image(
+                str(img_path)
+            )
+        img_uint8 = (segmentation_base_rgb * 255).clip(0, 255).astype(np.uint8)
+
+        profile = self.color_calibration_profile
+        if profile is not None and self.color_calibration_applied:
+            actual_kind = (
+                "raw"
+                if img_path.suffix.lower() in RAW_IMAGE_EXTENSIONS
+                else "rendered_rgb"
+            )
+            profile_kind = profile.data["input"]["kind"]
+            if profile_kind == "jpeg":
+                profile_kind = "rendered_rgb"
+            if actual_kind != profile_kind:
+                raise ValueError(
+                    f"calibration profile expects {profile_kind} input, "
+                    f"but {img_path.name} is {actual_kind}"
+                )
+            if wb_method != profile.data["preprocessing"]["white_balance"]:
+                raise ValueError(
+                    "white-balance override does not match active calibration profile"
+                )
+            if wb_method == "gray_card":
+                profile_gray = np.asarray(
+                    profile.data["preprocessing"]["gray_card_rgb"], dtype=np.float64
+                )
+                if wb_gray_roi is None or not np.allclose(profile_gray, wb_gray_roi):
+                    raise ValueError(
+                        "gray-card override does not match active calibration profile"
+                    )
 
         # ---- Step 2: 分割 ----
-        segmentation_rgb = img_rgb
+        segmentation_rgb = segmentation_base_rgb
         if self.normalize_segmentation_illumination:
-            segmentation_rgb = self.preprocessor.white_balance_gray_world(img_rgb)
+            segmentation_rgb = self.preprocessor.white_balance_gray_world(
+                segmentation_base_rgb
+            )
         raw_mask = self._segment_image(segmentation_rgb)
         component_mask = self._select_analysis_mask(
             raw_mask,
@@ -355,7 +603,7 @@ class LeafColorPipeline:
         if self.exclude_white_tissue:
             mask, white_tissue_qc = self._exclude_white_tissue(
                 component_mask,
-                img_rgb,
+                segmentation_base_rgb,
                 max_saturation=self.white_tissue_max_saturation,
                 min_retained_fraction=self.white_tissue_min_retained_fraction,
             )
@@ -379,10 +627,45 @@ class LeafColorPipeline:
         feature_views = self._crop_to_mask(
             mask,
             rgb=img_rgb,
-            rgb_uint8=img_uint8,
         )
         feature_mask = feature_views.pop("mask")
-        feature_lab = rgb_to_lab(feature_views["rgb"])
+        calibration_qc = {
+            "QC_CCM_applied": 0.0,
+            "QC_CCM_negative_fraction": 0.0,
+            "QC_CCM_clipped_fraction": 0.0,
+            "QC_CCM_R_clipped_fraction": 0.0,
+            "QC_CCM_G_clipped_fraction": 0.0,
+            "QC_CCM_B_clipped_fraction": 0.0,
+        }
+        if (
+            profile is not None
+            and self.color_calibration_applied
+            and profile.data["target"]["space"] == "XYZ"
+        ):
+            application = apply_calibration_profile(
+                profile, feature_views["rgb"], mask=feature_mask
+            )
+            feature_views["rgb"] = application.srgb
+            feature_views["rgb_uint8"] = (
+                application.srgb * 255
+            ).clip(0, 255).astype(np.uint8)
+            feature_lab = application.lab_d65
+            calibration_qc.update(application.qc)
+            calibration_qc["QC_CCM_applied"] = 1.0
+        elif self.preprocessor.has_color_correction_matrix:
+            feature_views["rgb"] = self.preprocessor.apply_color_correction(
+                feature_views["rgb"]
+            )
+            feature_views["rgb_uint8"] = (
+                feature_views["rgb"] * 255
+            ).clip(0, 255).astype(np.uint8)
+            feature_lab = rgb_to_lab(feature_views["rgb"])
+            calibration_qc["QC_CCM_applied"] = 1.0
+        else:
+            feature_views["rgb_uint8"] = (
+                feature_views["rgb"] * 255
+            ).clip(0, 255).astype(np.uint8)
+            feature_lab = rgb_to_lab(feature_views["rgb"])
         feature_hsv = rgb_to_hsv(feature_views["rgb"])
 
         # ---- Step 3: 颜色特征 ----
@@ -424,6 +707,7 @@ class LeafColorPipeline:
         all_features.update(shape_feats)
         all_features.update(uniformity_feats)
         all_features.update(mask_qc)
+        all_features.update(calibration_qc)
 
         # ---- 元数据 ----
         sid = sample_id or parse_sample_id(img_path.name)
@@ -1086,6 +1370,7 @@ class LeafColorPipeline:
             "failed_images": int(len(self.last_batch_failures)),
             "output_samples": int(output_samples),
             "component_policy": self.component_policy,
+            "color_calibration": self._color_calibration_manifest(),
             "config_sha256": hashlib.sha256(serialized_config.encode("utf-8")).hexdigest(),
             "config": self.config,
             "runtime": {
@@ -1101,6 +1386,34 @@ class LeafColorPipeline:
             encoding="utf-8",
         )
         return manifest_path
+
+    def _color_calibration_manifest(self) -> Dict[str, object]:
+        profile = self.color_calibration_profile
+        if profile is not None and self.color_calibration_applied:
+            matrix = profile.matrix
+        else:
+            matrix = self.preprocessor._ccm
+        return {
+            "mode": self.color_calibration_mode,
+            "status": self.color_calibration_status,
+            "applied": self.color_calibration_applied,
+            "source": self.color_calibration_source,
+            "matrix_sha256": self.color_calibration_matrix_sha256,
+            "matrix": matrix.tolist() if matrix is not None else None,
+            "profile_id": profile.profile_id if profile is not None else None,
+            "profile_sha256": profile.sha256 if profile is not None else None,
+            "input_domain": profile.input_domain if profile is not None else None,
+            "input": deepcopy(profile.data["input"]) if profile is not None else None,
+            "preprocessing": (
+                deepcopy(profile.data["preprocessing"])
+                if profile is not None else None
+            ),
+            "model": deepcopy(profile.data["model"]) if profile is not None else None,
+            "target": deepcopy(profile.data["target"]) if profile is not None else None,
+            "reference": deepcopy(profile.data["reference"]) if profile is not None else None,
+            "datasets": deepcopy(profile.data.get("datasets")) if profile is not None else None,
+            "quality": deepcopy(profile.data["quality"]) if profile is not None else None,
+        }
 
     # ----------------------------------------------------------
     # 可视化

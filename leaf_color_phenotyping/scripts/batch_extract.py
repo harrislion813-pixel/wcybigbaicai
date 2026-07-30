@@ -60,6 +60,10 @@ def parse_args():
     parser.add_argument("--device", type=str, default=None,
                         choices=["cpu", "cuda"],
                         help="计算设备（未指定时读取配置，默认 cpu）")
+    parser.add_argument(
+        "--camera-id", type=str, default=None,
+        help="本批图像的相机标识；必须与颜色校准 Profile 一致",
+    )
     parser.add_argument("--white-balance", "-wb", type=str,
                         default=None,
                         choices=["gray_world", "perfect_reflector", "gray_card", "none"],
@@ -74,6 +78,14 @@ def parse_args():
                         help="显示详细进度")
     parser.add_argument("--allow-partial", action="store_true",
                         help="即使部分图像处理失败，也以成功状态退出")
+    parser.add_argument(
+        "--color-profile", type=str, default=None,
+        help="颜色校准 Profile (.ccm.json)，覆盖配置文件中的 profile_file",
+    )
+    parser.add_argument(
+        "--require-color-calibration", action="store_true",
+        help="缺少经过验证的颜色校准 Profile 时拒绝运行",
+    )
 
     return parser.parse_args()
 
@@ -111,6 +123,15 @@ def main():
         config.setdefault("segmentation", {})["model_path"] = str(Path(args.model).resolve())
     if args.device:
         config.setdefault("segmentation", {})["device"] = args.device
+    if args.camera_id:
+        config.setdefault("imaging", {})["camera_id"] = args.camera_id
+    if args.color_profile:
+        calibration = config.setdefault("color_calibration", {})
+        calibration["profile_file"] = str(Path(args.color_profile).resolve())
+        if calibration.get("mode") == "off":
+            calibration["mode"] = "optional"
+    if args.require_color_calibration:
+        config.setdefault("color_calibration", {})["mode"] = "required"
 
     # ---- 输入输出 ----
     config_dir = Path(config.get("_config_dir", "."))
@@ -145,17 +166,29 @@ def main():
     )
 
     # ---- 运行流水线 ----
+    # 先完成颜色校准预检；required 模式在读取任何图像前失败。
+    pipeline = LeafColorPipeline(config)
+    calibration_status = getattr(pipeline, "color_calibration_status", "unknown")
+    calibration_mode = getattr(pipeline, "color_calibration_mode", "off")
+
     print("=" * 60)
     print("大白菜叶色表型批量提取")
     print("=" * 60)
     print(f"  Input:        {input_dir}")
     print(f"  Output:       {output_csv}")
+    print(f"  Color calibration: {calibration_status} ({calibration_mode})")
     print(f"  Segmentation: {effective_method}")
     print(f"  White balance: {effective_white_balance}")
     print(f"  Aggregate:    {not args.no_aggregate}")
     print("=" * 60)
+    if calibration_mode != "off" and not getattr(
+        pipeline, "color_calibration_applied", False
+    ):
+        print(
+            "[COLOR CALIBRATION WARNING] No validated calibration profile is "
+            "active. Do not treat this run as absolute or cross-batch color data."
+        )
 
-    pipeline = LeafColorPipeline(config)
     df = pipeline.process_batch(
         image_dir=input_dir,
         output_csv=output_csv,

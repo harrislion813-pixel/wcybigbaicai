@@ -6,6 +6,8 @@
 
 一句话理解整个流程：**读取图片 → 找出叶片区域 → 只在叶片内计算指标 → 检查绿色轮廓和 QC → 导出表格**。程序不会仅凭文件存在就认为结果可靠，正式分析前仍需要人工抽查分割效果。
 
+颜色校准现在是正式分析的高优先级模块。分割始终使用不受 CCM 影响的图像支路；校正后的颜色只在最终叶片掩膜内计算。跨批次或跨设备定量必须使用通过独立验证的 Calibration Profile v2，不能把裸矩阵或未经验证的拟合当作绝对颜色依据。
+
 ## 目录
 
 1. [先了解三个重要规则](#一先了解三个重要规则)
@@ -189,8 +191,15 @@ data/raw_images/
 
 ```yaml
 imaging:
+  camera_id: ""
   white_balance: "none"
   raw_use_camera_wb: true
+  exposure_normalization: "fixed_capture"
+
+color_calibration:
+  mode: "off"
+  profile_file: ""
+  allow_legacy_matrix: false
 
 segmentation:
   method: "auto"
@@ -257,6 +266,10 @@ python scripts\batch_extract.py --no-aggregate --visualize --verbose
 - `QC_mask_area_ratio`：最终掩膜占整张图的比例；
 - `QC_mask_is_empty`：`1` 表示没有识别到叶片；
 - `QC_bbox_x/y/width/height`：所有掩膜的总包围框。
+- `QC_CCM_applied`：`1` 表示本图实际应用了经过运行时检查的颜色校准 Profile；
+- `QC_CCM_negative_fraction`：校准结果中至少一个显示 RGB 通道低于 0 的叶片像素比例；
+- `QC_CCM_clipped_fraction`：转换为显示 sRGB 时至少一个通道需要裁剪的叶片像素比例；
+- `QC_CCM_R/G/B_clipped_fraction`：各显示通道的裁剪比例。颜色统计的 Lab 来自未裁剪 XYZ，显示图才裁剪。
 
 如果一批图片的拍摄距离一致，`QC_mask_area_ratio` 突然明显偏大通常表示背景或标尺被识别；突然接近 0 通常表示漏分割。
 
@@ -335,7 +348,10 @@ python scripts\batch_extract.py [参数]
 | `--method`, `-m` | 读取配置 | 可选 `exg`、`grabcut`、`unet`、`sam`、`auto` |
 | `--model` | 读取配置 | U-Net 或 SAM 权重文件路径 |
 | `--device` | 读取配置，通常为 `cpu` | `cpu` 或 `cuda` |
+| `--camera-id` | 读取 `imaging.camera_id` | 临时声明本批图像的相机标识；必须与颜色 Profile 一致 |
 | `--white-balance`, `-wb` | 读取配置 | `gray_world`、`perfect_reflector`、`gray_card` 或 `none` |
+| `--color-profile` | 读取配置 | 临时指定 Calibration Profile v2 (`.ccm.json`) |
+| `--require-color-calibration` | 关闭 | 强制本次运行必须加载 `validated` Profile；缺失、草稿或哈希不匹配时在处理图片前失败 |
 | `--id-pattern` | 自动解析 | 自定义样本编号正则表达式，第一个捕获组必须是样本 ID |
 | `--no-aggregate` | 默认聚合 | 每张图片保留一行，不按 `sample_id` 求均值 |
 | `--visualize` | 读取 `separate_visualization` | 保存“原图 + 绿色轮廓 + 关键指标”图片 |
@@ -383,8 +399,10 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 | 字段 | 当前默认值 | 说明 |
 |---|---|---|
 | `color_space` | `sRGB` | 目标颜色空间说明项；读取函数当前固定输出 sRGB |
+| `camera_id` | 空 | 本批图像的相机标识；启用 Profile 时必须与其中的 `input.camera_id` 一致 |
 | `white_balance` | `none` | 表型定量使用的白平衡方法；RAW 默认已使用相机白平衡 |
 | `raw_use_camera_wb` | `true` | RAW 解码时是否应用相机记录的白平衡 |
+| `exposure_normalization` | `fixed_capture` | Profile 拍摄/归一化条件标识；运行值必须与 Profile 完全一致 |
 | `target_illuminant` | `D65` | sRGB/CIELAB 目标参考光源 |
 | `gray_card_rgb` | 未设置 | `gray_card` 模式必填，格式为 `[R, G, B]`，范围 `[0,1]` |
 | `bits_per_channel` | `16` | RAW 后处理位深；普通 16-bit PNG/TIFF 也会保留原始动态范围 |
@@ -403,17 +421,15 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 
 可以把它理解成两张用途不同的图：一张临时图只负责“把叶片找准”，另一张原始色值图负责“把颜色算准”。前者的光照归一化不会写回后者。
 
-### `color_calibration`：颜色校准矩阵
+### `color_calibration`：颜色校准 Profile
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `enabled` | `false` | 是否启用 CCM；没有经过验证的矩阵时不要开启 |
-| `method` | `polynomial` | `linear` 或 `polynomial` |
-| `polynomial_degree` | `2` | 多项式阶数；二阶矩阵应为 `9 × 3` |
-| `ccm_file` | 空 | `.npy`、`.json`、`.yaml`、`.yml`、`.csv` 或空白分隔文本 |
-| `matrix` | 未设置 | 也可直接在 YAML 中写矩阵，优先级高于 `ccm_file` |
+| `mode` | `off` | `off` 完全关闭；`optional` 仅在 Profile 存在且状态为 `validated` 时应用；`required` 不满足条件立即失败 |
+| `profile_file` | 空 | Calibration Profile v2 (`.ccm.json`) 路径；内容哈希、矩阵和验证指标都会进入运行清单 |
+| `allow_legacy_matrix` | `false` | 兼容旧裸矩阵的临时开关；只允许 `optional`，`required` 永远拒绝裸矩阵 |
 
-`enabled: true` 但既没有 `matrix` 也没有 `ccm_file` 时，程序会立即报错，避免把未校准数据误当成已校准数据。
+默认 `off` 且 `profile_file` 为空，因此不会应用校准。正式跨批次分析应改为 `required`；这样 Profile 缺失、状态为 `draft`、内容哈希不一致、输入颜色域不兼容或模型不受支持时，都会在处理第一张图片之前终止。
 
 白平衡和 CCM 不是一回事：白平衡主要修正光源造成的整体偏色，CCM 用色卡进一步修正相机对不同颜色的响应。没有色卡实测数据时，不要凭空启用 CCM。
 
@@ -689,6 +705,7 @@ ImagePreprocessor(
     polynomial_degree=2,
     raw_use_camera_wb=True,
     raw_output_bps=16,
+    working_domain="encoded_srgb",
 )
 ```
 
@@ -696,25 +713,38 @@ ImagePreprocessor(
 |---|---|
 | `target_illuminant` | 目标光源名称；ColorChecker D50 参考值会先做 Bradford D50→D65 色适应 |
 | `calibration_method` | `linear` 或 `polynomial` |
-| `polynomial_degree` | 多项式 CCM 阶数 |
+| `polynomial_degree` | 旧式编码 RGB 多项式 CCM 阶数；只支持 `1`、`2`、`3` |
 | `raw_use_camera_wb` | RAW 解码时是否应用相机白平衡 |
 | `raw_output_bps` | RAW 后处理位深，`8` 或 `16` |
+| `working_domain` | `encoded_srgb`、`linear_srgb` 或 `camera_linear_rgb`；必须与 Profile 一致 |
 
 #### 公开方法
 
 | 函数 | 关键参数 | 返回值与用途 |
 |---|---|---|
-| `read_raw(raw_path, use_camera_wb=True, output_bps=16, linear_output=False)` | RAW 路径；是否使用相机白平衡；8/16 bit；是否输出线性 sRGB | 返回 `float32 RGB [0,1]`。默认使用相机白平衡、标准 sRGB gamma、关闭自动增亮 |
+| `read_raw(raw_path, use_camera_wb=True, output_bps=16, linear_output=False, output_color="srgb")` | RAW 路径、白平衡、位深、gamma 与 `srgb/raw` 输出域 | 返回 `float32 RGB [0,1]`；`camera_linear_rgb` Profile 仅接受 RAW 输入 |
 | `read_image(image_path)` | 普通图片路径 | 返回 `float32 RGB [0,1]` |
 | `white_balance_gray_world(img_rgb)` | RGB 数组 | 灰度世界白平衡后的 RGB |
 | `white_balance_perfect_reflector(img_rgb, percentile=99.9)` | RGB 数组和高亮百分位 | 完美反射法白平衡结果 |
 | `white_balance_gray_card(img_rgb, gray_roi)` | RGB 数组；形状为 `(3,)` 的灰卡均值 | 灰卡白平衡结果 |
 | `set_color_correction_matrix(matrix)` | 线性 `3×3` 或对应阶数的多项式矩阵 | 校验并保存 CCM |
 | `load_color_correction_matrix(path)` | `.npy/.json/.yaml/.csv/文本` | 读取、校验并保存 CCM |
-| `compute_color_correction_matrix(measured_rgb, reference_lab=None)` | 测得的 `N×3` 色块 RGB；参考 Lab | 最小二乘计算并保存 CCM |
+| `compute_color_correction_matrix(measured_rgb, reference_lab=None, reference_id=None, return_report=False)` | 严格归一化的 `N×3 float RGB [0,1]`；自定义 Lab 或显式色卡版本 | 默认兼容旧 API 返回矩阵；`return_report=True` 返回包含矩阵、秩、条件数、残差和训练 ΔE00 的 `CalibrationFitResult`。拒绝空集、长度不等、非有限值、样本不足、秩亏和病态设计矩阵 |
 | `apply_color_correction(img_rgb)` | `float RGB [0,1]` | 应用当前 CCM；未设置 CCM 时返回原图并警告 |
 | `process(image_path, white_balance_method="none", gray_roi=None, apply_ccm=True, compute_derived=True)` | 图片、白平衡、灰卡值、CCM 与派生空间开关 | 默认返回 `rgb`、`rgb_uint8`、`hsv`、`lab`；批处理会先裁剪再计算 HSV/Lab |
+| `process_segmentation_image(image_path)` | 图片路径 | 返回与表型 CCM 无关的 encoded-sRGB 分割代理图 |
 | `has_color_correction_matrix` | 只读属性 | 是否已经加载或计算 CCM |
+
+#### Calibration Profile v2：`src.color_calibration`
+
+| 函数或对象 | 用途 |
+|---|---|
+| `CalibrationProfile.from_mapping(...)` / `load_calibration_profile(path)` | 校验 schema、状态、输入域、矩阵形状、质量报告和 SHA-256 完整性 |
+| `write_calibration_profile(profile, path)` | 生成规范 JSON、计算内容哈希并在写入前再次校验 |
+| `lab_d50_to_xyz_d65(reference_lab)` | 把色卡 D50 Lab 经 Bradford 适应直接转为 D65 XYZ，不经过 sRGB 裁剪 |
+| `fit_rgb_to_xyz_model(measured_rgb, target_xyz_d65, model_type=...)` | 在线性光域拟合 `linear_3x3` 或二阶 root-polynomial RGB→XYZ 模型 |
+| `validate_rgb_to_xyz_model(...)` | 在独立数据上输出平均、中位、p95 和最大 ΔE00 |
+| `apply_calibration_profile(profile, rgb)` | 保留未裁剪 XYZ/Lab，同时另行输出裁剪后的显示 sRGB 与分通道裁剪 QC |
 
 ### 8.3 叶片分割：`src.segmentation`
 
@@ -831,7 +861,8 @@ ImagePreprocessor(
 | `rgb_to_chromaticity_uv(img_rgb)` | RGB 图像 | 返回 `u_prime, v_prime` |
 | `channel_stats(channel, percentiles=(...))` | 单通道数组和百分位 | 返回均值、标准差、范围、中位数、偏度、峰度和百分位 |
 | `histogram_features(channel, bins=32)` | `[0,255]` 通道和分箱数 | 返回归一化 `hist_bin_*` |
-| `get_colorchecker_lab_d65()` | 无 | 对内置 ColorChecker D50 数据执行 Bradford 色适应后返回 D65 Lab |
+| `get_colorchecker_reference_lab(reference_id)` | `before_nov_2014` 或 `after_nov_2014` | 返回明确生产版本的 24 色块 D50 Lab 副本；顺序由 `COLORCHECKER_24_PATCH_IDS` 定义 |
+| `get_colorchecker_lab_d65(reference_id)` | `before_nov_2014` 或 `after_nov_2014` | 对显式版本的 ColorChecker D50 数据执行 Bradford 色适应后返回 D65 Lab；省略版本只为旧 API 兼容并会警告 |
 | `delta_e_76(lab1, lab2)` | 两组 Lab | 返回 CIE76 色差 |
 | `delta_e_94(lab1, lab2, k_L=1, k_C=1, k_H=1)` | Lab 和权重 | 返回 CIE94 色差 |
 | `delta_e_2000(lab1, lab2)` | 两组 Lab | 返回 CIEDE2000；大图逐像素计算较慢 |
@@ -947,41 +978,95 @@ segmentation:
 
 ## 十、颜色校准
 
-颜色校准不是“打开开关就自动完成”。当前项目能够加载、计算和应用 CCM，但自动寻找 ColorChecker 的函数仍是预留接口。
+颜色校准不是“打开开关就自动完成”。项目现在把“拟合、验证、应用、审计”分开：校准工具生成带版本和质量报告的 Profile；批处理只应用通过完整性检查且状态为 `validated` 的 Profile；分割始终走独立支路，所以切换 CCM 不会改变叶片面积和形状。
 
-如果只是固定相机和光源下做同一批次的相对比较，优先保证拍摄条件一致并保留校准参考图；如果要比较不同时间、不同设备或不同光源下的绝对颜色，才更需要经过验证的 CCM。无论哪种情况，都不要用未经验证的矩阵替代实际校准。
+### 10.1 CCM 怎样获得
 
-可靠流程是：
+1. 固定相机、镜头、光源、曝光和白平衡，拍摄一张训练色卡和另一张独立验证色卡。
+2. 按标准顺序提取 24 个色块均值，保存为两个 CSV。列必须精确为 `patch_id,R,G,B`，patch ID 可在 `src.utils.COLORCHECKER_24_PATCH_IDS` 中查看。
+3. 确认色卡生产版本：`before_nov_2014` 或 `after_nov_2014`。两个版本色料与参考值不同，不允许使用模糊的“ColorChecker Classic”默认值。
+4. 明确 CSV 数值尺度是 `1`、`255` 还是 `65535`，明确值属于 `linear_srgb` 还是 RAW 的 `camera_linear_rgb`。工具不会猜测或自动纠正错误尺度。
+5. 拟合 RGB→D65 XYZ，使用独立图验证 ΔE00，通过门槛后才得到 `validated` Profile。
 
-1. 在相同光源和相机设置下拍摄 ColorChecker。
-2. 人工或使用专门工具得到各色块的实测 RGB。
-3. 使用可靠参考 Lab 值计算 CCM。
-4. 在独立色卡图上验证 ΔE。
-5. 保存矩阵并在 `config.yaml` 中启用。
+示例：
 
-线性矩阵示例：
-
-```yaml
-color_calibration:
-  enabled: true
-  method: "linear"
-  ccm_file: "models/ccm_linear.npy"
+```powershell
+python scripts\calibrate_color.py fit `
+  --training-csv data\colorchecker\train.csv `
+  --validation-csv data\colorchecker\validation.csv `
+  --output models\camera_a_d65.ccm.json `
+  --profile-id camera-a-d65-v1 `
+  --camera-id camera-a `
+  --input-kind raw `
+  --input-domain camera_linear_rgb `
+  --input-scale 65535 `
+  --white-balance none `
+  --exposure-normalization fixed_capture `
+  --raw-use-camera-wb `
+  --reference-id after_nov_2014 `
+  --model auto
 ```
 
-二阶多项式输入展开为：
+`auto` 会同时检查线性 `3×3` 和二阶 root-polynomial。只有 root-polynomial 在验证集上的中位 ΔE00 至少改善 10%，同时 p95 不变差，才会选择更复杂的模型。默认质量门槛是：验证中位数 ≤ 2.5、p95 ≤ 6、绿色相关色块均值 ≤ 3、中性色块均值 ≤ 2。任一门槛失败仍会保存 Profile，但状态是 `draft`，命令退出码为 2。
+
+root-polynomial 使用曝光齐次基：
 
 ```text
-R, G, B, R², G², B², RG, RB, GB
+R, G, B, √(RG), √(RB), √(GB)
 ```
 
-因此二阶多项式 CCM 的形状必须是 `9 × 3`。
+它不会像普通高阶多项式那样因为曝光缩放而产生不同次数的非一致响应。拟合目标是未裁剪的 D65 XYZ；只有生成可视化 sRGB 时才裁剪，CIELAB 定量保留未裁剪的 XYZ 信息。
 
-在没有经过独立验证的 CCM 时，保持：
+### 10.2 应用与复核
 
 ```yaml
+imaging:
+  camera_id: "camera-a"
+  white_balance: "none"
+  raw_use_camera_wb: true
+  exposure_normalization: "fixed_capture"
+
 color_calibration:
-  enabled: false
+  mode: "required"
+  profile_file: "models/camera_a_d65.ccm.json"
+  allow_legacy_matrix: false
 ```
+
+也可以只对一次批处理覆盖配置：
+
+```powershell
+python scripts\batch_extract.py --camera-id camera-a --color-profile models\camera_a_d65.ccm.json --require-color-calibration --verbose
+```
+
+复核另一张色卡或查看 Profile：
+
+```powershell
+python scripts\calibrate_color.py validate --profile models\camera_a_d65.ccm.json --validation-csv data\colorchecker\check.csv --input-scale 65535
+python scripts\calibrate_color.py inspect --profile models\camera_a_d65.ccm.json
+```
+
+运行 manifest 会记录 Profile 路径、Profile SHA-256、实际矩阵、模型、色卡版本、输入颜色域、白平衡条件和质量报告；同一路径替换内容会产生不同哈希，且篡改 Profile 而未更新完整性哈希会直接失败。
+
+### 10.3 旧矩阵迁移
+
+旧 `.npy/.json/.csv/.txt` 裸矩阵只能迁移为 `draft`，不能因此获得“已验证”资格：
+
+```powershell
+python scripts\calibrate_color.py migrate-legacy `
+  --matrix models\old_ccm.npy `
+  --output models\old_ccm_draft.ccm.json `
+  --model linear_3x3 `
+  --profile-id old-camera-migration `
+  --camera-id camera-a `
+  --input-kind rendered_rgb `
+  --input-scale 1 `
+  --white-balance none `
+  --exposure-normalization unknown `
+  --no-raw-use-camera-wb `
+  --reference-id before_nov_2014
+```
+
+`required` 模式永远拒绝裸矩阵和 `draft` Profile。`optional` 模式也不会应用 `draft`，只会明确报告未校准状态。固定相机与光源下做同批次相对比较时，可以保持默认 `off`；跨批次、跨设备或绝对颜色分析应使用 `required`。
 
 ---
 
@@ -1115,16 +1200,18 @@ leaf_color_phenotyping/
 │   └── train/
 │       ├── images/              # U-Net 训练图片
 │       └── masks/               # U-Net 二值掩膜
-├── models/                      # U-Net、SAM 或 CCM 文件
+├── models/                      # U-Net、SAM 或 .ccm.json Profile
 ├── output/
 │   ├── leaf_color_phenotypes.csv
 │   └── visualizations/
 ├── scripts/
 │   ├── batch_extract.py         # 批量提取命令
+│   ├── calibrate_color.py       # 拟合、验证、检查和迁移颜色 Profile
 │   └── train_segmentation.py    # U-Net 训练命令
 ├── src/
 │   ├── pipeline.py              # 主流水线
 │   ├── preprocessing.py         # RAW、白平衡、颜色校准
+│   ├── color_calibration.py     # Profile v2、RGB→XYZ 拟合、ΔE 与裁剪 QC
 │   ├── segmentation.py          # 叶片分割
 │   ├── color_features.py        # 颜色特征
 │   ├── vegetation_indices.py    # 植被指数

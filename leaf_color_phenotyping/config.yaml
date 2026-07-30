@@ -11,20 +11,21 @@ input:
 
 # ---------- 成像参数 ----------
 imaging:
+  camera_id: ""                 # 使用颜色 Profile 时必须与 Profile 完全一致
   color_space: "sRGB"           # 目标颜色空间
   white_balance: "none"         # RAW 默认使用相机白平衡；跨批次优先使用统一灰卡增益
   raw_use_camera_wb: true        # RAW 解码时使用相机记录的白平衡
+  exposure_normalization: "fixed_capture"  # Profile 必须与本项一致
   target_illuminant: "D65"      # CIELAB/sRGB 参考光源
   # gray_card_rgb: [0.5, 0.5, 0.5]  # gray_card 模式必填，范围 [0,1]
   bits_per_channel: 16          # 输出位深 (8/16)
 
 # ---------- 颜色校准 (X-Rite ColorChecker 24) ----------
 color_calibration:
-  # 只有提供已验证 CCM 时才能启用，避免静默输出未校准数据。
-  enabled: false
-  method: "polynomial"          # polynomial | linear
-  polynomial_degree: 2          # 多项式阶数
-  ccm_file: ""                  # .npy/.json/.yaml/.csv，路径相对本配置文件
+  # 默认关闭最安全；试运行可用 optional，正式跨批次分析使用 required。
+  mode: "off"                   # off | optional | required
+  profile_file: ""              # 推荐使用带版本、验证结果和哈希的 .ccm.json
+  allow_legacy_matrix: false     # 裸 .npy/.csv 矩阵不能用于正式分析
 
 # ---------- 叶片分割参数 ----------
 segmentation:
