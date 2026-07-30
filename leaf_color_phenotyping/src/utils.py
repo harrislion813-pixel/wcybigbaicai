@@ -39,11 +39,15 @@ def find_images(
     Returns:
         排序后的图像路径列表
     """
-    img_paths = []
-    for ext in extensions:
-        img_paths.extend(Path(directory).rglob(f"*{ext}"))
-        img_paths.extend(Path(directory).rglob(f"*{ext.upper()}"))
-    return sorted(set(img_paths))
+    allowed_extensions = {
+        extension.lower() if extension.startswith(".") else f".{extension.lower()}"
+        for extension in extensions
+    }
+    return sorted(
+        path
+        for path in Path(directory).rglob("*")
+        if path.is_file() and path.suffix.lower() in allowed_extensions
+    )
 
 
 def parse_sample_id(filename: str, pattern: Optional[str] = None) -> str:
@@ -527,12 +531,13 @@ def delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:
          - 0.20 * np.cos(4 * H_mean - np.deg2rad(63)))
 
     dtheta = np.deg2rad(30) * np.exp(-((H_mean - np.deg2rad(275)) / np.deg2rad(25)) ** 2)
-    C_mean_prime_7 = C_mean ** 7  # 近似
+    C_mean_prime = (C1_prime + C2_prime) / 2
+    C_mean_prime_7 = C_mean_prime ** 7
     R_C = 2 * np.sqrt(C_mean_prime_7 / (C_mean_prime_7 + 25 ** 7) + 1e-10)
 
     S_L = 1 + (0.015 * (L_mean - 50) ** 2) / np.sqrt(20 + (L_mean - 50) ** 2 + 1e-10)
-    S_C = 1 + 0.045 * C_mean
-    S_H = 1 + 0.015 * C_mean * T
+    S_C = 1 + 0.045 * C_mean_prime
+    S_H = 1 + 0.015 * C_mean_prime * T
 
     R_T = -np.sin(2 * dtheta) * R_C
 

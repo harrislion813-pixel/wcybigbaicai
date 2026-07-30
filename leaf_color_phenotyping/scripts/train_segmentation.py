@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-U-Net / DeepLabV3+ 叶片分割模型训练脚本。
+U-Net 叶片分割模型训练脚本。
 
 支持的数据集格式:
     - 目录结构: images/ + masks/ (同名PNG, mask为二值图)
@@ -93,7 +93,11 @@ class LeafSegmentationDataset(Dataset):
                 if "std_range" in noise_parameters:
                     gaussian_noise = A.GaussNoise(std_range=(0.012, 0.028), p=0.2)
                 else:
-                    gaussian_noise = A.GaussNoise(var_limit=(10, 50), p=0.2)
+                    # Albumentations 1.x expresses this as variance in the
+                    # image's native scale. Inputs are float RGB [0, 1].
+                    gaussian_noise = A.GaussNoise(
+                        var_limit=(0.012**2, 0.028**2), p=0.2
+                    )
 
                 self.transform = A.Compose([
                     random_crop,
@@ -108,7 +112,8 @@ class LeafSegmentationDataset(Dataset):
                     gaussian_noise,
                     A.Blur(blur_limit=3, p=0.2),
                     A.Normalize(mean=IMAGENET_MEAN.tolist(),
-                                std=IMAGENET_STD.tolist()),
+                                std=IMAGENET_STD.tolist(),
+                                max_pixel_value=1.0),
                 ])
             except ImportError:
                 print("WARNING: albumentations not installed, using basic transform")
@@ -119,7 +124,8 @@ class LeafSegmentationDataset(Dataset):
                 self.transform = A.Compose([
                     A.Resize(height=image_size[0], width=image_size[1]),
                     A.Normalize(mean=IMAGENET_MEAN.tolist(),
-                                std=IMAGENET_STD.tolist()),
+                                std=IMAGENET_STD.tolist(),
+                                max_pixel_value=1.0),
                 ])
             except ImportError:
                 self.transform = None
@@ -131,7 +137,9 @@ class LeafSegmentationDataset(Dataset):
         img_path, mask_path = self.pairs[idx]
 
         # 读取图像
-        img = read_image_rgb(img_path, as_float=False)
+        # Decode every supported integer bit depth to one common float [0, 1]
+        # representation before augmentation and ImageNet normalization.
+        img = read_image_rgb(img_path, as_float=True)
 
         # 读取掩膜
         mask = read_image_gray(mask_path)

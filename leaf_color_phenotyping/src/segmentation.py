@@ -7,6 +7,7 @@
 """
 from pathlib import Path
 from typing import Optional, Tuple, Dict
+import inspect
 import numpy as np
 import cv2
 
@@ -15,12 +16,45 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def normalize_imagenet_rgb(img_rgb: np.ndarray) -> np.ndarray:
-    """Normalize a float RGB [0,1] image with ImageNet channel statistics."""
-    img = img_rgb.astype(np.float32)
-    if img.max() > 1.0:
-        img = img / 255.0
-    return (img - IMAGENET_MEAN) / IMAGENET_STD
+def normalize_imagenet_rgb(
+    img_rgb: np.ndarray,
+    mean: np.ndarray = IMAGENET_MEAN,
+    std: np.ndarray = IMAGENET_STD,
+) -> np.ndarray:
+    """Normalize RGB data with dtype-aware scaling and ImageNet statistics.
+
+    Integer arrays are scaled by their dtype maximum, so both uint8 and uint16
+    images follow the same [0, 1] path. Floating-point inputs must already be in
+    [0, 1] or use the explicitly supported [0, 255] convention.
+    """
+    source = np.asarray(img_rgb)
+    if source.size == 0:
+        raise ValueError("img_rgb must not be empty")
+
+    img = source.astype(np.float32)
+    if not np.isfinite(img).all():
+        raise ValueError("img_rgb contains NaN or infinite values")
+    if float(img.min()) < 0:
+        raise ValueError("img_rgb values must be non-negative")
+
+    if np.issubdtype(source.dtype, np.integer):
+        img /= float(np.iinfo(source.dtype).max)
+    elif float(img.max()) > 1.0:
+        if float(img.max()) > 255.0:
+            raise ValueError(
+                "floating-point img_rgb values must be in [0, 1] or [0, 255]"
+            )
+        img /= 255.0
+
+    mean_array = np.asarray(mean, dtype=np.float32)
+    std_array = np.asarray(std, dtype=np.float32)
+    if mean_array.shape != (3,) or std_array.shape != (3,):
+        raise ValueError("normalization mean and std must each contain three values")
+    if not np.isfinite(mean_array).all() or not np.isfinite(std_array).all():
+        raise ValueError("normalization mean and std must be finite")
+    if np.any(std_array <= 0):
+        raise ValueError("normalization std values must be positive")
+    return (img - mean_array) / std_array
 
 
 class BaseSegmenter:
@@ -242,6 +276,10 @@ class UNetSegmenter(BaseSegmenter):
         self.backbone = backbone
         self.device = device
         self._model = None
+        self.input_size: Optional[Tuple[int, int]] = None
+        self.normalization_mean = IMAGENET_MEAN.copy()
+        self.normalization_std = IMAGENET_STD.copy()
+        self.threshold = 0.5
 
     def _load_model(self):
         """延迟加载模型."""
@@ -255,13 +293,10 @@ class UNetSegmenter(BaseSegmenter):
         except ImportError:
             raise ImportError("需要安装 segmentation_models_pytorch: pip install segmentation-models-pytorch")
 
-        self._model = smp.Unet(
-            encoder_name=self.backbone,
-            encoder_weights=None,  # 使用自定义权重
-            in_channels=3,
-            classes=1,
-        )
-        checkpoint = torch.load(self.model_path, map_location=self.device)
+        load_kwargs = {"map_location": self.device}
+        if "weights_only" in inspect.signature(torch.load).parameters:
+            load_kwargs["weights_only"] = True
+        checkpoint = torch.load(self.model_path, **load_kwargs)
         if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
             checkpoint_backbone = checkpoint.get("backbone")
             if checkpoint_backbone and checkpoint_backbone != self.backbone:
@@ -270,10 +305,53 @@ class UNetSegmenter(BaseSegmenter):
                     f"configured backbone '{self.backbone}'"
                 )
             state_dict = checkpoint["state_dict"]
-            self.threshold = float(checkpoint.get("threshold", 0.5))
+            threshold = float(checkpoint.get("threshold", 0.5))
+            if not np.isfinite(threshold) or not 0 <= threshold <= 1:
+                raise ValueError("Checkpoint threshold must be finite and in [0, 1]")
+            self.threshold = threshold
+
+            image_size = checkpoint.get("image_size")
+            if image_size is not None:
+                if (
+                    not isinstance(image_size, (list, tuple))
+                    or len(image_size) != 2
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, np.integer))
+                        or int(value) <= 0
+                        for value in image_size
+                    )
+                ):
+                    raise ValueError(
+                        "Checkpoint image_size must contain two positive integers"
+                    )
+                self.input_size = (int(image_size[0]), int(image_size[1]))
+
+            normalization = checkpoint.get("normalization")
+            if normalization is not None:
+                if not isinstance(normalization, dict):
+                    raise ValueError("Checkpoint normalization must be a mapping")
+                mean = np.asarray(normalization.get("mean"), dtype=np.float32)
+                std = np.asarray(normalization.get("std"), dtype=np.float32)
+                if mean.shape != (3,) or std.shape != (3,):
+                    raise ValueError(
+                        "Checkpoint normalization mean/std must contain three values"
+                    )
+                if not np.isfinite(mean).all() or not np.isfinite(std).all():
+                    raise ValueError("Checkpoint normalization values must be finite")
+                if np.any(std <= 0):
+                    raise ValueError("Checkpoint normalization std must be positive")
+                self.normalization_mean = mean
+                self.normalization_std = std
         else:
             state_dict = checkpoint
-            self.threshold = 0.5
+
+        self._model = smp.Unet(
+            encoder_name=self.backbone,
+            encoder_weights=None,  # 使用自定义权重
+            in_channels=3,
+            classes=1,
+        )
         self._model.load_state_dict(state_dict)
         self._model.to(self.device)
         self._model.eval()
@@ -291,20 +369,25 @@ class UNetSegmenter(BaseSegmenter):
         import torch
         self._load_model()
 
-        if img_rgb.dtype == np.uint8:
-            img = img_rgb.astype(np.float32) / 255.0
-        else:
-            img = img_rgb.astype(np.float32)
+        img = np.asarray(img_rgb)
 
         h_orig, w_orig = img.shape[:2]
 
-        # Resize到32的倍数 (U-Net要求)
-        new_h = ((h_orig + 31) // 32) * 32
-        new_w = ((w_orig + 31) // 32) * 32
+        # New checkpoints carry the exact training size. Legacy state_dict-only
+        # checkpoints keep the historical nearest-multiple-of-32 behaviour.
+        if self.input_size is not None:
+            new_h, new_w = self.input_size
+        else:
+            new_h = ((h_orig + 31) // 32) * 32
+            new_w = ((w_orig + 31) // 32) * 32
         img_resized = cv2.resize(img, (new_w, new_h))
 
-        # 与训练阶段保持一致的 ImageNet 归一化。
-        img_resized = normalize_imagenet_rgb(img_resized)
+        # 与训练检查点记录的归一化参数保持一致。
+        img_resized = normalize_imagenet_rgb(
+            img_resized,
+            mean=self.normalization_mean,
+            std=self.normalization_std,
+        )
 
         # To tensor: (H,W,C) → (1,C,H,W)
         tensor = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).float()

@@ -126,7 +126,7 @@ Segmentation: auto
 
 ```text
 output/leaf_color_phenotypes.csv
-output/visualizations/图片名_vis.png
+output/visualizations/图片名__扩展名_vis.png
 ```
 
 第一次运行一定要打开可视化图片，确认绿色轮廓只围住叶片。
@@ -303,6 +303,8 @@ python scripts\batch_extract.py --visualize --verbose
 
 例如 `BJC-001_rep1.jpg` 和 `BJC-001_rep2.jpg` 会先各自出现在逐图表中，再在聚合表中合成 `BJC-001` 一行；原性状列保存两次重复的均值，`*_rep_std` 表示两次结果的差异大小。
 
+聚合前会检查发育时期、处理条件和用户元数据是否在同一 `sample_id` 内保持一致。发现冲突时程序会停止并报告字段名，避免把不同处理静默求平均；此时应修正样本编号，或使用 `--no-aggregate` 检查逐图记录。
+
 ### 步骤 8：保存实验记录
 
 正式分析至少保留：
@@ -421,7 +423,7 @@ python scripts\batch_extract.py --config configs\experiment_02.yaml --verbose
 |---|---|---|
 | `method` | `auto` | 分割方法 |
 | `component_policy` | `largest` | `largest` 选择面积最大的植被候选域；`all` 使用所有候选域 |
-| `component_min_exg` | `0.30` | `largest` 模式筛选植被候选域的最小归一化 ExG |
+| `component_min_exg` | `0.30` | `largest` 模式筛选植被候选域的最小归一化 ExG；没有候选域达标时返回空掩膜并由 QC 标记 |
 | `max_processing_dimension` | `2200` | 分割代理图最长边；掩膜映射回原图，颜色仍按原始像素计算 |
 | `normalize_illumination` | `true` | 是否仅为分割做灰度世界光照归一化 |
 | `exclude_white_tissue` | `true` | 是否在主要叶片内部剔除低饱和度的白色叶柄和主脉 |
@@ -549,8 +551,10 @@ output/leaf_color_phenotypes_manifest.json
 默认位置：
 
 ```text
-output/visualizations/<原文件名>_vis.png
+output/visualizations/<输入相对子目录>/<主文件名>__<扩展名>_vis.png
 ```
+
+保留输入相对子目录并写入原扩展名，可避免递归目录中的同名 JPG、PNG 或不同批次图片互相覆盖。
 
 内容包括原图、绿色叶片轮廓、红色白组织剔除标记，以及 L*、a*、b*、GLI、DGCI、最大轮廓面积和白组织剔除比例。红色区域不会参与颜色、植被指数、纹理和均匀性计算。当前实现不会生成单独的热力图或纯掩膜文件；需要纯掩膜时请通过 Python API 的 `process_single(..., return_visualization=True)` 获取。
 
@@ -733,7 +737,7 @@ ImagePreprocessor(
 | `SAMSegmenter(sam_checkpoint, model_type="vit_h", device="cuda", ...)` | 检查点、模型类型、设备 | `segment(img_rgb, center_point=None)`；不传点时使用图像中心 |
 | `AutoSegmenter(iterations=5, ...)` | GrabCut 迭代次数 | ExG 候选 + GrabCut；不需要模型 |
 | `create_segmenter(method="auto", **kwargs)` | 方法名及构造参数 | 工厂函数；`auto` 在有效 U-Net 权重存在时优先使用 U-Net，否则使用 `AutoSegmenter` |
-| `normalize_imagenet_rgb(img_rgb)` | RGB 数组 | 将 `[0,1]` 或 `[0,255]` 图像按 ImageNet 均值和标准差归一化 |
+| `normalize_imagenet_rgb(img_rgb, mean=..., std=...)` | RGB 数组；可选三通道均值和标准差 | `uint8/uint16` 按 dtype 范围缩放；浮点 `[0,1]` 或 `[0,255]` 归一化后应用给定通道统计 |
 
 所有 `segment()` 方法都返回 `(H,W)` 的 `uint8` 二值掩膜，背景为 `0`，叶片为 `255`。
 
@@ -855,7 +859,7 @@ data/train/
 
 要求：
 
-- 图片支持 JPG、JPEG、PNG、TIF、TIFF；训练数据加载器不直接读取 RAF。
+- 图片支持 JPG、JPEG、PNG、TIF、TIFF；8 位和 16 位整数图片都会先按各自位深归一化到浮点 `[0,1]`，训练数据加载器不直接读取 RAF。
 - 掩膜与图片主文件名必须一致。
 - 掩膜是单通道二值图：背景 `0`，叶片 `255`。
 - 掩膜优先使用 PNG，也接受同名 JPG。
@@ -908,6 +912,8 @@ python scripts\train_segmentation.py --images data\train\images --masks data\tra
 训练按解析后的 `sample_id` 做约 80%/20% 分组划分，同一样本的重复图片不会跨入训练集和验证集。
 最佳检查点会同时保存 `state_dict`、backbone、输入尺寸、ImageNet 归一化参数、阈值和最佳验证 IoU；
 同名 JSON 文件保存训练历史。至少需要两个不同的样本编号才能进行无泄漏验证。
+
+推理会读取并验证检查点中的输入尺寸、归一化参数和阈值；权重使用受限反序列化加载。不要使用来源不明的旧格式模型文件。
 
 这里按样本分组而不是随机按图片划分，是为了避免同一片叶的重复照片同时出现在训练集和验证集中。否则验证分数可能看起来很高，但不能真实反映模型处理新样本的能力。
 
@@ -1090,7 +1096,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-当前测试覆盖 RAF 路由、RAW 后处理参数、颜色数学、边缘连通域过滤、重复汇总、输出格式和批处理失败报告等关键行为。
+当前测试覆盖 RAF 路由、RAW 后处理参数、8/16 位归一化、颜色数学、植被候选过滤、递归可视化命名、元数据冲突、U-Net 检查点契约、重复汇总、输出格式和批处理失败报告等关键行为。仓库还会通过 GitHub Actions 在 Python 3.10 和 3.12 上自动运行同一测试集。
 
 ### 项目结构
 

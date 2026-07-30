@@ -32,7 +32,6 @@ class ImagePreprocessor:
             calibration_method: 颜色校正方法
                 - "linear": 3×3 线性回归
                 - "polynomial": 多项式回归 (推荐)
-                - "root_polynomial": 根多项式回归
             polynomial_degree: 多项式阶数 (method="polynomial" 时有效)
         """
         if str(target_illuminant).upper() != "D65":

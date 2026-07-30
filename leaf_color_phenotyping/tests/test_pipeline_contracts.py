@@ -11,7 +11,7 @@ import src.segmentation as segmentation_module
 from scripts import batch_extract
 from src.pipeline import LeafColorPipeline
 from src.preprocessing import ImagePreprocessor
-from src.segmentation import BaseSegmenter, GrabCutSegmenter
+from src.segmentation import BaseSegmenter, GrabCutSegmenter, UNetSegmenter
 from src.utils import (
     find_images, parse_sample_id, read_image_rgb, split_pairs_by_sample,
     write_image_rgb,
@@ -77,6 +77,14 @@ def test_find_images_includes_uppercase_raf(tmp_path):
     raf_path.write_bytes(b"test")
 
     assert find_images(str(tmp_path)) == [raf_path]
+
+
+def test_find_images_handles_mixed_case_extensions_in_one_recursive_walk(tmp_path):
+    image_path = tmp_path / "nested" / "leaf.JpG"
+    image_path.parent.mkdir()
+    image_path.write_bytes(b"test")
+
+    assert find_images(str(tmp_path)) == [image_path]
 
 
 def test_raf_is_routed_through_raw_reader(tmp_path, monkeypatch):
@@ -333,6 +341,28 @@ def test_synthetic_image_runs_through_batch_pipeline(tmp_path):
     assert pipeline.last_batch_failures == []
 
 
+def test_process_single_rejects_metadata_that_overwrites_reserved_fields(tmp_path):
+    image = np.full((32, 32, 3), 255, dtype=np.uint8)
+    image[8:24, 8:24] = [30, 160, 30]
+    image_path = tmp_path / "leaf.png"
+    write_image_rgb(image_path, image)
+    pipeline = LeafColorPipeline({
+        "segmentation": {"method": "exg", "min_leaf_area_ratio": 0.01},
+        "features": {
+            "vegetation_indices": {"enabled": False},
+            "texture": {"enabled": False},
+            "shape": {"enabled": False},
+        },
+    })
+
+    with pytest.raises(ValueError, match="metadata keys collide.*sample_id"):
+        pipeline.process_single(
+            str(image_path),
+            metadata={"sample_id": "wrong"},
+            verbose=False,
+        )
+
+
 def test_all_batch_failures_are_written_to_a_report(tmp_path, monkeypatch):
     image_dir = tmp_path / "images"
     image_dir.mkdir()
@@ -381,6 +411,107 @@ def test_largest_component_policy_is_reflected_in_qc():
     assert qc["QC_component_count"] == 2
     assert qc["QC_raw_mask_area_px"] == 125
     assert np.isclose(qc["QC_largest_component_fraction"], 0.8)
+
+
+def test_component_min_exg_rejects_nonvegetation_instead_of_falling_back():
+    gray_image = np.full((20, 20, 3), 0.5, dtype=np.float32)
+    single_component = np.zeros((20, 20), dtype=np.uint8)
+    single_component[2:12, 2:12] = 255
+
+    selected = LeafColorPipeline._select_analysis_mask(
+        single_component,
+        "largest",
+        img_rgb=gray_image,
+        min_exg=0.30,
+    )
+
+    assert not np.any(selected)
+
+
+def test_component_min_exg_selects_smaller_valid_vegetation_component():
+    image = np.full((30, 30, 3), 0.5, dtype=np.float32)
+    raw_mask = np.zeros((30, 30), dtype=np.uint8)
+    raw_mask[2:16, 2:16] = 255
+    raw_mask[20:26, 20:26] = 255
+    image[20:26, 20:26] = [0.1, 0.8, 0.1]
+
+    selected = LeafColorPipeline._select_analysis_mask(
+        raw_mask,
+        "largest",
+        img_rgb=image,
+        min_exg=0.30,
+    )
+
+    assert np.count_nonzero(selected) == 36
+    assert np.all(selected[20:26, 20:26] == 255)
+    assert not np.any(selected[2:16, 2:16])
+
+
+def test_recursive_visualization_paths_do_not_collide(tmp_path):
+    image_root = tmp_path / "images"
+    vis_root = tmp_path / "visualizations"
+    first = image_root / "batch-a" / "leaf.jpg"
+    second = image_root / "batch-b" / "leaf.jpg"
+    third = image_root / "batch-a" / "leaf.png"
+
+    paths = {
+        LeafColorPipeline._visualization_output_path(vis_root, image_root, path)
+        for path in (first, second, third)
+    }
+
+    assert len(paths) == 3
+    assert vis_root / "batch-a" / "leaf__jpg_vis.png" in paths
+    assert vis_root / "batch-b" / "leaf__jpg_vis.png" in paths
+    assert vis_root / "batch-a" / "leaf__png_vis.png" in paths
+
+
+def test_batch_writes_both_recursive_visualizations_with_duplicate_stems(tmp_path):
+    image_root = tmp_path / "images"
+    first = image_root / "batch-a" / "leaf.png"
+    second = image_root / "batch-b" / "leaf.png"
+    image = np.full((32, 32, 3), 255, dtype=np.uint8)
+    image[8:24, 8:24] = [30, 160, 30]
+    write_image_rgb(first, image)
+    write_image_rgb(second, image)
+    vis_root = tmp_path / "visualizations"
+    pipeline = LeafColorPipeline({
+        "segmentation": {"method": "exg", "min_leaf_area_ratio": 0.01},
+        "features": {"texture": {"enabled": False}},
+    })
+
+    result = pipeline.process_batch(
+        str(image_root),
+        group_by_sample=False,
+        save_visualizations=True,
+        visualization_dir=str(vis_root),
+        verbose=False,
+    )
+
+    assert len(result) == 2
+    assert (vis_root / "batch-a" / "leaf__png_vis.png").exists()
+    assert (vis_root / "batch-b" / "leaf__png_vis.png").exists()
+
+
+def test_aggregate_rejects_conflicting_metadata_within_sample():
+    frame = pd.DataFrame({
+        "sample_id": ["A", "A"],
+        "image_path": ["a1.png", "a2.png"],
+        "treatment": ["control", "salt"],
+        "GLI": [0.2, 0.4],
+    })
+
+    with pytest.raises(ValueError, match="Conflicting metadata.*treatment"):
+        LeafColorPipeline._aggregate_by_sample(frame, trait_columns=["GLI"])
+
+
+def test_aggregate_without_traits_also_rejects_conflicting_metadata():
+    frame = pd.DataFrame({
+        "sample_id": ["A", "A"],
+        "developmental_stage": ["seedling", "heading"],
+    })
+
+    with pytest.raises(ValueError, match="Conflicting metadata.*developmental_stage"):
+        LeafColorPipeline._aggregate_by_sample(frame, trait_columns=[])
 
 
 def test_white_tissue_filter_removes_low_saturation_pixels_inside_leaf():
@@ -477,6 +608,59 @@ def test_segmentation_uses_bounded_proxy_and_restores_mask_size():
 
     assert seen_shapes == [(128, 256, 3)]
     assert mask.shape == (400, 800)
+
+
+def test_unet_checkpoint_metadata_is_loaded_with_restricted_deserialization(monkeypatch):
+    captured = {}
+
+    class FakeModel:
+        def load_state_dict(self, state_dict):
+            captured["state_dict"] = state_dict
+
+        def to(self, device):
+            captured["model_device"] = device
+            return self
+
+        def eval(self):
+            captured["evaluated"] = True
+            return self
+
+    def fake_load(path, map_location=None, weights_only=False):
+        captured["load"] = {
+            "path": path,
+            "map_location": map_location,
+            "weights_only": weights_only,
+        }
+        return {
+            "state_dict": {"weight": "sentinel"},
+            "backbone": "resnet34",
+            "image_size": [320, 480],
+            "normalization": {
+                "mean": [0.1, 0.2, 0.3],
+                "std": [0.4, 0.5, 0.6],
+            },
+            "threshold": 0.65,
+        }
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    fake_torch.load = fake_load
+    fake_smp = types.ModuleType("segmentation_models_pytorch")
+    fake_smp.Unet = lambda **kwargs: FakeModel()
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "segmentation_models_pytorch", fake_smp)
+
+    segmenter = UNetSegmenter(
+        "checkpoint.pth", backbone="resnet34", device="cpu"
+    )
+    segmenter._load_model()
+
+    assert captured["load"]["weights_only"] is True
+    assert captured["state_dict"] == {"weight": "sentinel"}
+    assert segmenter.input_size == (320, 480)
+    assert np.allclose(segmenter.normalization_mean, [0.1, 0.2, 0.3])
+    assert np.allclose(segmenter.normalization_std, [0.4, 0.5, 0.6])
+    assert segmenter.threshold == 0.65
 
 
 def test_training_split_keeps_sample_replicates_together():

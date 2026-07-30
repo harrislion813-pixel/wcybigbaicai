@@ -1,4 +1,5 @@
 import numpy as np
+from skimage.color import deltaE_ciede2000
 
 from src.color_features import ColorFeatureExtractor
 from src.preprocessing import ImagePreprocessor
@@ -57,11 +58,30 @@ def test_ciede2000_matches_published_reference_pair():
     assert np.isclose(delta_e_2000(lab1, lab2), 2.0425, atol=1e-4)
 
 
+def test_ciede2000_uses_adjusted_chroma_mean_for_scaling_terms():
+    lab1 = np.array([93.01836883149842, -4.196087743587356, -0.13324334773534474])
+    lab2 = np.array([96.22590047566601, 30.383796935346396, -17.213089977153032])
+
+    expected = deltaE_ciede2000(lab1, lab2)
+
+    assert np.isclose(delta_e_2000(lab1, lab2), expected, atol=1e-8)
+
+
 def test_imagenet_normalization_is_shared_and_deterministic():
     black = np.zeros((1, 1, 3), dtype=np.float32)
     normalized = normalize_imagenet_rgb(black)[0, 0]
 
     assert np.allclose(normalized, -IMAGENET_MEAN / IMAGENET_STD)
+
+
+def test_imagenet_normalization_scales_uint16_by_dtype_range():
+    image = np.array([[[0, 32768, 65535]]], dtype=np.uint16)
+    expected_rgb = image.astype(np.float32) / 65535.0
+
+    normalized = normalize_imagenet_rgb(image)
+
+    expected = (expected_rgb - IMAGENET_MEAN) / IMAGENET_STD
+    assert np.allclose(normalized, expected)
 
 
 def test_color_extractor_respects_explicit_empty_color_spaces():

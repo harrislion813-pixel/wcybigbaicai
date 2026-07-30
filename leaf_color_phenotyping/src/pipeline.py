@@ -427,6 +427,21 @@ class LeafColorPipeline:
 
         # ---- 元数据 ----
         sid = sample_id or parse_sample_id(img_path.name)
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                raise TypeError("metadata must be a dictionary")
+            reserved_metadata_keys = {
+                "sample_id", "image_path", "replicate", "developmental_stage",
+                "features", "metadata", "mask", "visualization",
+            }
+            collisions = sorted(
+                set(metadata) & (reserved_metadata_keys | set(all_features))
+            )
+            if collisions:
+                raise ValueError(
+                    "metadata keys collide with reserved/result fields: "
+                    f"{collisions}"
+                )
         result: Dict[str, object] = {
             "sample_id": sid,
             "features": all_features,
@@ -499,6 +514,7 @@ class LeafColorPipeline:
             return pd.DataFrame()
 
         vis_dir = None
+        image_root = Path(image_dir).resolve()
         if save_visualizations:
             if visualization_dir:
                 vis_dir = Path(visualization_dir)
@@ -525,7 +541,10 @@ class LeafColorPipeline:
                     verbose=verbose,
                 )
                 if save_visualizations and vis_dir is not None and "visualization" in result:
-                    write_image_rgb(vis_dir / f"{img_path.stem}_vis.png", result["visualization"])
+                    vis_path = self._visualization_output_path(
+                        vis_dir, image_root, img_path
+                    )
+                    write_image_rgb(vis_path, result["visualization"])
                     result.pop("visualization", None)
                     result.pop("mask", None)
                 records.append(result)
@@ -644,17 +663,19 @@ class LeafColorPipeline:
         min_exg: float = 0.30,
     ) -> np.ndarray:
         """Apply the configured connected-component policy consistently."""
-        mask_bin = (mask > (127 if mask.max() > 1 else 0)).astype(np.uint8)
-        if policy == "all" or not np.any(mask_bin):
-            return mask_bin * 255
-        if policy != "largest":
+        if policy not in {"largest", "all"}:
             raise ValueError(f"Unknown component policy: {policy}")
+        mask_bin = (mask > (127 if mask.max() > 1 else 0)).astype(np.uint8)
+        if not np.any(mask_bin):
+            return mask_bin * 255
+        if policy == "all":
+            return mask_bin * 255
 
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask_bin, 8)
-        if count <= 1:
-            return mask_bin * 255
         candidate_labels = list(range(1, count))
         if img_rgb is not None:
+            if img_rgb.shape[:2] != mask_bin.shape:
+                raise ValueError("mask and img_rgb must have matching height and width")
             red, green, blue = (
                 img_rgb[..., 0], img_rgb[..., 1], img_rgb[..., 2]
             )
@@ -664,8 +685,12 @@ class LeafColorPipeline:
                 label for label in candidate_labels
                 if float(exg[labels == label].mean()) >= min_exg
             ]
-            if vegetation_labels:
-                candidate_labels = vegetation_labels
+            if not vegetation_labels:
+                return np.zeros_like(mask_bin, dtype=np.uint8)
+            candidate_labels = vegetation_labels
+
+        if not candidate_labels:
+            return np.zeros_like(mask_bin, dtype=np.uint8)
 
         selected_label = max(
             candidate_labels, key=lambda label: stats[label, cv2.CC_STAT_AREA]
@@ -831,6 +856,64 @@ class LeafColorPipeline:
         return feats
 
     @staticmethod
+    def _visualization_output_path(
+        visualization_dir: Path,
+        image_root: Path,
+        image_path: Path,
+    ) -> Path:
+        """Return a collision-resistant visualization path for recursive input."""
+        resolved_image = image_path.resolve()
+        try:
+            relative_image = resolved_image.relative_to(image_root.resolve())
+        except ValueError:
+            relative_image = Path(resolved_image.name)
+        extension_token = relative_image.suffix.lstrip(".") or "image"
+        filename = f"{relative_image.stem}__{extension_token}_vis.png"
+        return Path(visualization_dir) / relative_image.parent / filename
+
+    @staticmethod
+    def _metadata_value_key(value: object) -> str:
+        """Create a stable comparison key for scalar or JSON-like metadata."""
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, (bool, np.bool_)) and missing:
+                return "__missing__"
+        except (TypeError, ValueError):
+            pass
+        return json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _validate_metadata_consistency(
+        cls,
+        df: pd.DataFrame,
+        metadata_columns: List[str],
+    ) -> None:
+        """Reject sample groups whose experimental metadata is inconsistent."""
+        conflicts = []
+        for column in metadata_columns:
+            for sample_id, values in df.groupby(
+                "sample_id", dropna=False, sort=True
+            )[column]:
+                unique_values = {
+                    cls._metadata_value_key(value) for value in values.tolist()
+                }
+                if len(unique_values) > 1:
+                    conflicts.append(f"{sample_id!r}:{column}")
+        if conflicts:
+            preview = ", ".join(conflicts[:10])
+            suffix = " ..." if len(conflicts) > 10 else ""
+            raise ValueError(
+                "Conflicting metadata within sample groups: "
+                f"{preview}{suffix}. Use distinct sample IDs or --no-aggregate."
+            )
+
+    @staticmethod
     def _aggregate_by_sample(df: pd.DataFrame,
                              trait_columns: Optional[List[str]] = None,
                              include_cv: bool = False,
@@ -838,7 +921,7 @@ class LeafColorPipeline:
         """按样本ID汇总多重复测量.
 
         对数值型特征计算: mean, std, cv (变异系数)
-        对非数值列: 取第一个值
+        对非数值实验元数据: 要求组内一致后取第一个值
         """
         if "sample_id" not in df.columns:
             return df
@@ -864,14 +947,37 @@ class LeafColorPipeline:
                 result["image_paths"] = result["image_path"].astype(str)
             return result
 
-        if not trait_columns:
-            grouped = groupby.first()
-            grouped["n_replicates"] = group_sizes
-            return grouped.reset_index()
-
         missing_traits = [col for col in trait_columns if col not in df.columns]
         if missing_traits:
             raise ValueError(f"Unknown trait columns: {missing_traits}")
+
+        metadata_columns = [
+            col for col in df.columns
+            if col not in {"sample_id", "image_path", "replicate"}
+            and col not in trait_columns
+        ]
+        if metadata_columns:
+            LeafColorPipeline._validate_metadata_consistency(
+                df, metadata_columns
+            )
+
+        if not trait_columns:
+            grouped = (
+                groupby[metadata_columns].first()
+                if metadata_columns
+                else pd.DataFrame(index=group_sizes.index)
+            )
+            grouped["n_replicates"] = group_sizes
+            if "image_path" in df.columns:
+                grouped = grouped.join(
+                    groupby["image_path"].first().rename("image_path")
+                )
+                grouped = grouped.join(
+                    groupby["image_path"].agg(
+                        lambda values: ";".join(str(value) for value in values)
+                    ).rename("image_paths")
+                )
+            return grouped.reset_index()
 
         agg_dict = {col: ["mean", "std"] for col in trait_columns}
         grouped = groupby.agg(agg_dict)
@@ -906,13 +1012,12 @@ class LeafColorPipeline:
         grouped = pd.concat([grouped, n_replicates], axis=1).copy()
 
         # 保留图像路径、发育阶段和用户元数据等非性状列。
-        metadata_columns = [
-            col for col in df.columns
-            if col != "sample_id" and col not in trait_columns
-        ]
         if metadata_columns:
             grouped = grouped.join(groupby[metadata_columns].first())
         if "image_path" in df.columns:
+            grouped = grouped.join(
+                groupby["image_path"].first().rename("image_path")
+            )
             image_paths = groupby["image_path"].agg(
                 lambda values: ";".join(str(value) for value in values)
             ).rename("image_paths")
