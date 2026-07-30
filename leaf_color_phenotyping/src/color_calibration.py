@@ -1,8 +1,8 @@
 """Versioned, self-describing color-calibration profiles.
 
 The batch runtime intentionally keeps profile application lightweight. Profile
-creation and advanced colour-science fitting live in the optional calibration
-tooling, while every runtime artifact remains independently auditable.
+creation and validation are orchestrated by ``calibration_workflow`` while
+every runtime artifact remains independently auditable.
 """
 
 from __future__ import annotations

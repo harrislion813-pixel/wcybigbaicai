@@ -632,29 +632,3 @@ def delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:
         (dH_prime / (1 * S_H)) ** 2 +
         R_T * (dC_prime / (1 * S_C)) * (dH_prime / (1 * S_H))
     )
-
-
-# ============================================================
-# 图像配准辅助
-# ============================================================
-
-def find_colorchecker_roi(img_rgb: np.ndarray,
-                          target_size: Tuple[int, int] = (24, 24)
-                          ) -> Optional[np.ndarray]:
-    """自动检测 ColorChecker 色卡 ROI.
-
-    使用 OpenCV 轮廓检测 + 近似多边形方法.
-
-    Args:
-        img_rgb: 输入RGB图像 (BGR 或 RGB, uint8)
-        target_size: 色卡采样分辨率
-
-    Returns:
-        (24, 3) 的色块平均RGB值数组, 或 None
-    """
-    # 简化版: 使用用户手动标注 + 透视变换
-    # 生产环境建议使用专门的色卡检测库 (如 colour-checker-detection)
-    # 此处保留接口, 完整实现见 colour-science 库
-    print("WARNING: auto colorchecker detection not implemented. "
-          "Please use manual ROI annotation or install colour-checker-detection.")
-    return None

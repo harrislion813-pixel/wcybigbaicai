@@ -13,16 +13,16 @@
 项目现在提供本地桌面界面，日常分析和 CCM 校准不再需要输入命令或修改
 `config.yaml`。完整图文流程见 [桌面版使用指南](GUI_GUIDE.md)。
 
-Windows 首次使用时双击：
+Windows 首次使用时运行：
 
 ```text
-安装桌面版依赖.bat
+install_gui.cmd
 ```
 
-之后双击：
+当前电脑之后双击：
 
 ```text
-启动桌面版.bat
+启动桌面版.lnk
 ```
 
 桌面版包括：
@@ -125,8 +125,8 @@ python -m pip install -r requirements.txt
 
 `requirements.txt` 足够完成命令行批量提取。桌面界面使用
 `requirements-gui.txt`；训练 U-Net 使用 `requirements-train.txt`，开发测试使用
-`requirements-dev.txt`，颜色校准命令行工具使用
-`requirements-calibration.txt`，运行 Notebook 使用 `requirements-notebook.txt`。
+`requirements-dev.txt`，运行 Notebook 使用 `requirements-notebook.txt`。颜色校准
+所需依赖已经包含在核心依赖中，不再需要单独的 requirements 文件。
 
 #### 第 4 步：放入图片
 
@@ -899,7 +899,14 @@ ImagePreprocessor(
 | `delta_e_76(lab1, lab2)` | 两组 Lab | 返回 CIE76 色差 |
 | `delta_e_94(lab1, lab2, k_L=1, k_C=1, k_H=1)` | Lab 和权重 | 返回 CIE94 色差 |
 | `delta_e_2000(lab1, lab2)` | 两组 Lab | 返回 CIEDE2000；大图逐像素计算较慢 |
-| `find_colorchecker_roi(img_rgb, target_size=(24,24))` | RGB 图像和目标尺寸 | 当前为预留接口，会警告并返回 `None`，尚未自动检测色卡 |
+
+### 8.8 色卡图片工具：`src.colorchecker_detection`
+
+| 函数 | 参数 | 返回值/说明 |
+|---|---|---|
+| `detect_colorchecker_corners(display_rgb)` | 显示 RGB 图像 | 使用 OpenCV MCC，并以轮廓法回退，返回色卡四角 |
+| `extract_colorchecker_patches(working_rgb, display_rgb=None, corners=None)` | 工作域 RGB、显示图和可选四角 | 透视校正、方向判断并返回 24 色块中位 RGB 与检查预览 |
+| `load_calibration_image(path, input_domain="linear_srgb", ...)` | RAW 或普通色卡图 | 返回与正式分析一致的工作域 RGB、显示 RGB 和输入类型 |
 
 ---
 
@@ -1224,7 +1231,6 @@ leaf_color_phenotyping/
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── requirements-train.txt
-├── requirements-calibration.txt
 ├── requirements-notebook.txt
 ├── README.md
 ├── data/

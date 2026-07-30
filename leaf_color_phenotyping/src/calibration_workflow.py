@@ -206,7 +206,7 @@ def _quality_report(
     }
 
 
-def _reference_metadata(reference_id: str) -> Dict[str, str]:
+def reference_metadata(reference_id: str) -> Dict[str, str]:
     if reference_id not in {"before_nov_2014", "after_nov_2014"}:
         raise ValueError("Unsupported ColorChecker reference version")
     source = (
@@ -291,7 +291,7 @@ def fit_calibration_profile(request: CalibrationProfileRequest) -> CalibrationPr
             "observer": "2_degree",
             "display_encoding": "sRGB with explicit gamut clipping only for display",
         },
-        "reference": _reference_metadata(request.reference_id),
+        "reference": reference_metadata(request.reference_id),
         "datasets": {
             "training": {
                 "path": str(training_path),

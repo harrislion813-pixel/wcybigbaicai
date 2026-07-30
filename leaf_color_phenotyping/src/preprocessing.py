@@ -296,8 +296,8 @@ class ImagePreprocessor:
             measured_rgb, reference_lab
         )
 
-        # 参考Lab → 目标RGB (简化: 使用标准sRGB的前向模型)
-        # 实际使用中建议用 colour-science 库做 Lab→XYZ→RGB 的精确转换
+        # 旧 API 的参考 Lab → 目标 RGB 兼容路径。正式 Profile 工作流使用
+        # src.color_calibration 中带 D50→D65 色适应的 XYZ 拟合。
         ref_rgb = self._lab_to_srgb_approx(reference_lab)
 
         if self.calibration_method == "linear":
@@ -577,7 +577,7 @@ class ImagePreprocessor:
     def _lab_to_srgb_approx(lab: np.ndarray) -> np.ndarray:
         """Convert ColorChecker Lab (D50) values to display-referred sRGB (D65).
 
-        精确转换建议使用 colour-science 库.
+        该函数仅服务旧矩阵兼容；正式校准使用 Calibration Profile v2。
         """
         lab = np.asarray(lab, dtype=np.float64)
         if lab.ndim != 2 or lab.shape[1:] != (3,):

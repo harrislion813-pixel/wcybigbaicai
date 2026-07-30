@@ -13,11 +13,10 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 import sys
-from typing import Any, Dict, Iterable, Mapping
+from typing import Iterable
 
 import numpy as np
 
@@ -25,18 +24,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.color_calibration import (  # noqa: E402
     CalibrationModelFit,
-    fit_rgb_to_xyz_model,
     lab_d50_to_xyz_d65,
     load_calibration_profile,
     rgb_to_xyz_delta_e00,
-    validate_rgb_to_xyz_model,
     write_calibration_profile,
-    xyz_d65_to_srgb,
 )
 from src.calibration_workflow import (  # noqa: E402
     CalibrationGates,
     CalibrationProfileRequest,
+    NEUTRAL_PATCH_IDS,
+    VEGETATION_PATCH_IDS,
+    choose_calibration_model,
+    delta_e_metrics,
     fit_calibration_profile,
+    reference_metadata,
+    sha256_file,
 )
 from src.utils import (  # noqa: E402
     COLORCHECKER_24_PATCH_IDS,
@@ -45,41 +47,9 @@ from src.utils import (  # noqa: E402
 
 
 INPUT_SCALES = {"1": 1.0, "255": 255.0, "65535": 65535.0}
-VEGETATION_PATCH_IDS = {
-    "foliage",
-    "bluish_green",
-    "yellow_green",
-    "green",
-    "cyan",
-}
-NEUTRAL_PATCH_IDS = {
-    "white_95",
-    "neutral_8",
-    "neutral_65",
-    "neutral_5",
-    "neutral_35",
-    "black_2",
-}
 
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _metrics(values: np.ndarray) -> Dict[str, float]:
-    array = np.asarray(values, dtype=np.float64)
-    if array.ndim != 1 or len(array) == 0 or not np.isfinite(array).all():
-        raise ValueError("Delta E values must be a non-empty finite vector")
-    return {
-        "mean": float(np.mean(array)),
-        "median": float(np.median(array)),
-        "p95": float(np.percentile(array, 95)),
-        "max": float(np.max(array)),
-    }
+# Backward-compatible public name used by existing integrations and tests.
+choose_model = choose_calibration_model
 
 
 def read_patch_csv(
@@ -97,7 +67,7 @@ def read_patch_csv(
 
     required = tuple(required_patch_ids)
     expected = {"patch_id", "R", "G", "B"}
-    rows: Dict[str, list[float]] = {}
+    rows: dict[str, list[float]] = {}
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or set(reader.fieldnames) != expected:
@@ -142,157 +112,17 @@ def read_patch_csv(
     return required, rgb
 
 
-def choose_model(
-    fits: Mapping[str, CalibrationModelFit],
-    validation_metrics: Mapping[str, Mapping[str, float]],
-    *,
-    root_min_median_improvement: float = 0.10,
-) -> str:
-    """Prefer root-polynomial only for a material, non-regressive validation gain."""
-    if set(fits) == {"linear_3x3"}:
-        return "linear_3x3"
-    if set(fits) == {"root_polynomial_2"}:
-        return "root_polynomial_2"
-    linear = validation_metrics["linear_3x3"]
-    root = validation_metrics["root_polynomial_2"]
-    median_limit = linear["median"] * (1.0 - root_min_median_improvement)
-    if root["median"] <= median_limit and root["p95"] <= linear["p95"]:
-        return "root_polynomial_2"
-    return "linear_3x3"
-
-
-def _fit_candidates(
-    training_rgb: np.ndarray,
-    validation_rgb: np.ndarray,
-    target_xyz: np.ndarray,
-    requested_model: str,
-) -> tuple[CalibrationModelFit, Dict[str, Dict[str, float]], str]:
-    model_types = (
-        ("linear_3x3", "root_polynomial_2")
-        if requested_model == "auto"
-        else (requested_model,)
-    )
-    fits: Dict[str, CalibrationModelFit] = {}
-    validation: Dict[str, Dict[str, float]] = {}
-    for model_type in model_types:
-        fit = fit_rgb_to_xyz_model(
-            training_rgb,
-            target_xyz,
-            model_type=model_type,
-        )
-        fits[model_type] = fit
-        validation[model_type] = validate_rgb_to_xyz_model(
-            validation_rgb,
-            target_xyz,
-            fit,
-        )
-    selected = choose_model(fits, validation)
-    return fits[selected], validation, selected
-
-
-def _quality_report(
-    fit: CalibrationModelFit,
-    validation_rgb: np.ndarray,
-    target_xyz: np.ndarray,
-    patch_ids: tuple[str, ...],
-    args: argparse.Namespace,
-) -> Dict[str, Any]:
-    delta_e = rgb_to_xyz_delta_e00(validation_rgb, target_xyz, fit)
-    id_to_index = {patch_id: index for index, patch_id in enumerate(patch_ids)}
-    vegetation = delta_e[[id_to_index[patch_id] for patch_id in VEGETATION_PATCH_IDS]]
-    neutral = delta_e[[id_to_index[patch_id] for patch_id in NEUTRAL_PATCH_IDS]]
-    validation = _metrics(delta_e)
-    vegetation_metrics = _metrics(vegetation)
-    neutral_metrics = _metrics(neutral)
-    gates = {
-        "median_max": float(args.max_median_delta_e),
-        "p95_max": float(args.max_p95_delta_e),
-        "vegetation_mean_max": float(args.max_vegetation_mean_delta_e),
-        "neutral_mean_max": float(args.max_neutral_mean_delta_e),
-    }
-    failures = []
-    if validation["median"] > gates["median_max"]:
-        failures.append("validation median Delta E 00")
-    if validation["p95"] > gates["p95_max"]:
-        failures.append("validation p95 Delta E 00")
-    if vegetation_metrics["mean"] > gates["vegetation_mean_max"]:
-        failures.append("vegetation-patch mean Delta E 00")
-    if neutral_metrics["mean"] > gates["neutral_mean_max"]:
-        failures.append("neutral-patch mean Delta E 00")
-
-    return {
-        "passed": not failures,
-        "failures": failures,
-        "rank": fit.rank,
-        "condition_number": fit.condition_number,
-        "training_delta_e00": fit.training_delta_e00,
-        "validation_delta_e00": validation,
-        "vegetation_validation_delta_e00": vegetation_metrics,
-        "neutral_validation_delta_e00": neutral_metrics,
-        "gates": gates,
-        "validation_patch_delta_e00": {
-            patch_id: float(delta_e[index])
-            for index, patch_id in enumerate(patch_ids)
-        },
-        "outlier_patch_ids": [
-            patch_id
-            for index, patch_id in enumerate(patch_ids)
-            if delta_e[index] > gates["p95_max"]
-        ],
-    }
-
-
-def _reference_metadata(reference_id: str) -> Dict[str, str]:
-    source = (
-        "BabelColor/X-Rite pre-November-2014 data"
-        if reference_id == "before_nov_2014"
-        else "X-Rite post-November-2014 data"
-    )
-    return {
-        "chart": "ColorChecker Classic 24",
-        "id": reference_id,
-        "source": source,
-        "source_space": "CIE Lab D50",
-    }
-
-
 def command_fit(args: argparse.Namespace) -> int:
-    gate_values = (
-        args.max_median_delta_e,
-        args.max_p95_delta_e,
-        args.max_vegetation_mean_delta_e,
-        args.max_neutral_mean_delta_e,
-    )
-    if not np.isfinite(gate_values).all() or np.any(np.asarray(gate_values) < 0):
-        raise ValueError("Delta E quality gates must be finite and non-negative")
-    if args.white_balance == "gray_card" and args.gray_card_rgb is None:
-        raise ValueError("--gray-card-rgb is required with --white-balance gray_card")
-    if args.white_balance != "gray_card" and args.gray_card_rgb is not None:
-        raise ValueError("--gray-card-rgb is only valid with --white-balance gray_card")
-    if args.input_domain == "camera_linear_rgb" and args.input_kind != "raw":
-        raise ValueError("camera_linear_rgb profiles require --input-kind raw")
     training_path = Path(args.training_csv).resolve()
     validation_path = Path(args.validation_csv).resolve()
-    if training_path == validation_path:
-        raise ValueError("Training and validation CSV files must be independent")
-    training_sha256 = _sha256_file(training_path)
-    validation_sha256 = _sha256_file(validation_path)
-    if training_sha256 == validation_sha256:
-        raise ValueError(
-            "Training and validation CSV contents are identical; provide an "
-            "independent capture"
-        )
-
-    patch_ids, training_rgb = read_patch_csv(
+    _, training_rgb = read_patch_csv(
         training_path,
         input_scale=args.input_scale,
     )
-    validation_ids, validation_rgb = read_patch_csv(
+    _, validation_rgb = read_patch_csv(
         validation_path,
         input_scale=args.input_scale,
     )
-    if patch_ids != validation_ids:
-        raise ValueError("Training and validation patch orders do not match")
 
     result = fit_calibration_profile(CalibrationProfileRequest(
         training_rgb=training_rgb,
@@ -354,7 +184,7 @@ def command_validate(args: argparse.Namespace) -> int:
     if reference_id not in {"before_nov_2014", "after_nov_2014"}:
         raise ValueError("Custom references require a dedicated validation implementation")
     validation_path = Path(args.validation_csv).resolve()
-    validation_sha256 = _sha256_file(validation_path)
+    validation_sha256 = sha256_file(validation_path)
     training = profile.data.get("datasets", {}).get("training", {})
     if validation_sha256 == training.get("sha256"):
         raise ValueError("Validation CSV is the profile training dataset")
@@ -365,11 +195,11 @@ def command_validate(args: argparse.Namespace) -> int:
     target_xyz = lab_d50_to_xyz_d65(get_colorchecker_reference_lab(reference_id))
     delta_e = rgb_to_xyz_delta_e00(rgb, target_xyz, _profile_as_fit(profile))
     id_to_index = {patch_id: index for index, patch_id in enumerate(patch_ids)}
-    validation_metrics = _metrics(delta_e)
-    vegetation_metrics = _metrics(
+    validation_metrics = delta_e_metrics(delta_e)
+    vegetation_metrics = delta_e_metrics(
         delta_e[[id_to_index[item] for item in VEGETATION_PATCH_IDS]]
     )
-    neutral_metrics = _metrics(
+    neutral_metrics = delta_e_metrics(
         delta_e[[id_to_index[item] for item in NEUTRAL_PATCH_IDS]]
     )
     gates = profile.data.get("quality", {}).get("gates")
@@ -493,10 +323,10 @@ def command_migrate_legacy(args: argparse.Namespace) -> int:
             "illuminant": "D65",
             "observer": "2_degree",
         },
-        "reference": _reference_metadata(args.reference_id),
+        "reference": reference_metadata(args.reference_id),
         "migration": {
             "source_path": str(source),
-            "source_sha256": _sha256_file(source),
+            "source_sha256": sha256_file(source),
             "warning": "Unvalidated legacy matrix; refit and independently validate before use",
         },
         "quality": {

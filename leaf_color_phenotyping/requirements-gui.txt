@@ -1,4 +1,4 @@
--r requirements-calibration.txt
+-r requirements.txt
 
 # 本地桌面界面（无需浏览器）
 PySide6>=6.7,<7

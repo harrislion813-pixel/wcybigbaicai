@@ -1,4 +1,0 @@
--r requirements.txt
-
-# 用于独立色卡验证、光源转换和高级颜色科学分析。
-colour-science>=0.4.0
