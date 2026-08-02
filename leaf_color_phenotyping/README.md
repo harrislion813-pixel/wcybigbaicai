@@ -13,16 +13,18 @@
 项目现在提供本地桌面界面，日常分析和 CCM 校准不再需要输入命令或修改
 `config.yaml`。完整图文流程见 [桌面版使用指南](GUI_GUIDE.md)。
 
-Windows 首次使用时运行：
+Windows 用户在 PowerShell 中进入项目目录后运行：
 
-```text
-install_gui.cmd
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
-安装完成后双击：
+依赖只需安装一次，以后启动只需：
 
-```text
-start_gui.cmd
+```powershell
+.\.venv\Scripts\python.exe app.py
 ```
 
 桌面版包括：
@@ -104,21 +106,20 @@ RAF 和相机直出的 JPG 即使来自同一次拍摄，也可能存在不同�
 cd C:\Users\你的用户名\项目位置\wcybigbaicai\leaf_color_phenotyping
 ```
 
-#### 第 2 步：创建并启用虚拟环境
+#### 第 2 步：创建虚拟环境
 
 ```powershell
 python -m venv .venv
-Set-ExecutionPolicy -Scope Process Bypass
-.\.venv\Scripts\Activate.ps1
 ```
 
-如果命令行开头已经出现 `(.venv)`，说明环境已启用。
+后续命令直接调用 `.venv` 中的 Python，无需激活环境，也不受 PowerShell
+脚本执行策略影响。
 
 #### 第 3 步：安装依赖
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 读取 `.RAF`、`.CR2`、`.NEF`、`.ARW` 等 RAW 文件需要 `rawpy`。它已经写在 `requirements.txt` 中。
@@ -147,7 +148,7 @@ data/raw_images/
 #### 第 5 步：首次运行
 
 ```powershell
-python scripts\batch_extract.py --no-aggregate --visualize --verbose
+.\.venv\Scripts\python.exe scripts\batch_extract.py --no-aggregate --visualize --verbose
 ```
 
 脚本会自动加载项目根目录的 `config.yaml`。启动信息中应出现：
@@ -171,10 +172,9 @@ output/visualizations/图片名__扩展名_vis.png
 ```bash
 cd /path/to/wcybigbaicai/leaf_color_phenotyping
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python scripts/batch_extract.py --no-aggregate --visualize --verbose
+./.venv/bin/python -m pip install --upgrade pip
+./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python scripts/batch_extract.py --no-aggregate --visualize --verbose
 ```
 
 ---

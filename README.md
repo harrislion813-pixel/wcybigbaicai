@@ -6,9 +6,14 @@
 
 进入 `leaf_color_phenotyping` 文件夹后：
 
-1. 首次使用运行 `install_gui.cmd` 安装依赖。
-2. 之后双击项目目录中的 `start_gui.cmd` 启动程序。
-3. 在“叶片分析”中选择图片和结果文件夹，先预检，再开始分析。
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv\Scripts\python.exe app.py
+```
+
+首次安装后，以后只需运行最后一条命令。进入界面后，在“叶片分析”中选择图片
+和结果文件夹，先预检，再开始分析。
 
 CCM 颜色校准已经改为图形化向导：导入两张独立拍摄的 ColorChecker 24
 色卡图即可自动检测、取样、拟合和验证，不需要手工制作 RGB CSV。
@@ -33,10 +38,8 @@ CCM 颜色校准已经改为图形化向导：导入两张独立拍摄的 ColorC
 ```powershell
 cd leaf_color_phenotyping
 python -m venv .venv
-Set-ExecutionPolicy -Scope Process Bypass
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python scripts\batch_extract.py --no-aggregate --visualize --verbose
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe scripts\batch_extract.py --no-aggregate --visualize --verbose
 ```
 
 图片放入 `leaf_color_phenotyping/data/raw_images/`，结果生成在 `leaf_color_phenotyping/output/`。

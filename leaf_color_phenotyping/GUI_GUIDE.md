@@ -3,35 +3,35 @@
 桌面版把叶片批处理、分割预检、颜色校准和 Profile 管理集中在一个窗口中。
 所有计算仍使用原有 Python 流水线，命令行入口继续保留。
 
-## 1. 首次安装
-
-Windows 用户运行 `install_gui.cmd`。脚本会创建项目自己的 `.venv`
-环境，并安装分析、颜色校准和 PySide6 界面依赖。
+## 1. 安装和启动
 
 当前版本暂未制作独立安装包，因此电脑仍需预先安装 Python 3.10 或更高版本，
 首次安装依赖时需要联网。
 
-安装完成后双击 `start_gui.cmd`。它使用项目 `.venv` 中的 `pythonw.exe` 启动，
-不会显示命令行窗口，也不依赖本机绝对路径。
-
-如果命令脚本被浏览器、安全软件或系统策略拦截，也可以在 PowerShell 中执行：
+Windows 用户在 PowerShell 中进入项目目录后执行：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-gui.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
-之后运行：
+macOS 或 Linux 用户执行：
+
+```bash
+python3 -m venv .venv
+./.venv/bin/python -m pip install -r requirements-gui.txt
+./.venv/bin/python app.py
+```
+
+依赖只需安装一次。以后启动时，Windows 运行：
 
 ```powershell
-.\.venv\Scripts\pythonw.exe app.py
+.\.venv\Scripts\python.exe app.py
 ```
 
-也可以在已经激活的 Python 环境中运行：
-
-```powershell
-python app.py
-```
+直接调用虚拟环境中的 Python，不需要激活环境，也不受 CMD 文件关联或
+PowerShell 脚本执行策略影响；启动错误会直接显示在当前终端中。
 
 ## 2. 叶片分析
 
